@@ -10,14 +10,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
-
+	"github.com/scylladb/go-set/strset"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 
+	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
+	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -253,14 +254,14 @@ func (c *Controller) establishInterConnection(config map[string]string) error {
 		return err
 	}
 
-	subnet, err := c.acquireLrpAddress(util.InterconnectionSwitch)
+	lrpIP, err := c.acquireLrpAddress(util.InterconnectionSwitch)
 	if err != nil {
 		klog.Errorf("failed to acquire lrp address, %v", err)
 		return err
 	}
 
 	lrpName := fmt.Sprintf("%s-ts", config["az-name"])
-	if err := c.ovnClient.CreateLogicalPatchPort(util.InterconnectionSwitch, c.config.ClusterRouter, tsPort, lrpName, subnet, util.GenerateMac(), chassises...); err != nil {
+	if err := c.ovnClient.CreateLogicalPatchPort(util.InterconnectionSwitch, c.config.ClusterRouter, tsPort, lrpName, lrpIP, util.GenerateMac(), chassises...); err != nil {
 		klog.Errorf("failed to create ovn-ic lrp %v", err)
 		return err
 	}
@@ -281,10 +282,19 @@ func (c *Controller) acquireLrpAddress(ts string) (string, error) {
 	}
 
 	for {
-		random := util.GenerateRandomV4IP(cidr)
+		var random string
+		var ips []string
+		v4Cidr, v6Cidr := util.SplitStringIP(cidr)
+		if v4Cidr != "" {
+			ips = append(ips, util.GenerateRandomV4IP(v4Cidr))
+		}
 
+		if v6Cidr != "" {
+			ips = append(ips, util.GenerateRandomV6IP(v6Cidr))
+		}
+		random = strings.Join(ips, ",")
 		// find a free address
-		if _, ok := existAddress[random]; !ok {
+		if !existAddress.Has(random) {
 			return random, nil
 		}
 
@@ -347,45 +357,26 @@ func (c *Controller) waitTsReady() error {
 }
 
 func (c *Controller) delLearnedRoute() error {
-	originalPorts, err := c.ovnLegacyClient.CustomFindEntity("Logical_Router_Static_Route", []string{"_uuid", "ip_prefix"})
+	lrList, err := c.ovnClient.ListLogicalRouter(false, nil)
 	if err != nil {
-		klog.Errorf("failed to list static routes of logical router, %v", err)
+		klog.Errorf("failed to list logical routers: %v", err)
 		return err
 	}
-	filteredPorts, err := c.ovnLegacyClient.CustomFindEntity("Logical_Router_Static_Route", []string{"_uuid", "ip_prefix"}, "external_ids:ic-learned-route{<=}1")
-	if err != nil {
-		klog.Errorf("failed to filter static routes of logical router, %v", err)
-		return err
-	}
-	learnedPorts := []map[string][]string{}
-	for _, aOriPort := range originalPorts {
-		isFiltered := false
-		for _, aFtPort := range filteredPorts {
-			if aFtPort["_uuid"][0] == aOriPort["_uuid"][0] {
-				isFiltered = true
-			}
+	for _, lr := range lrList {
+		routeList, err := c.ovnClient.ListLogicalRouterStaticRoutes(lr.Name, nil, nil, "", map[string]string{"ic-learned-route": ""})
+		if err != nil {
+			klog.Errorf("failed to list learned static routes on logical router %s: %v", lr.Name, err)
+			return err
 		}
-		if !isFiltered {
-			learnedPorts = append(learnedPorts, aOriPort)
-		}
-	}
-	if len(learnedPorts) != 0 {
-		for _, aLdPort := range learnedPorts {
-			itsRouter, err := c.ovnLegacyClient.CustomFindEntity("Logical_Router", []string{"name"}, fmt.Sprintf("static_routes{>}%s", aLdPort["_uuid"][0]))
-			if err != nil {
-				klog.Errorf("failed to list logical router of static route %s, %v", aLdPort["_uuid"][0], err)
-				return err
-			} else if len(itsRouter) != 1 {
-				klog.Errorf("number wrong of logical router for static route %s, %v", aLdPort["_uuid"][0], itsRouter)
-				return nil
-			}
-			if err := c.ovnLegacyClient.DeleteStaticRoute(aLdPort["ip_prefix"][0], itsRouter[0]["name"][0]); err != nil {
-				klog.Errorf("failed to delete stale route %s, %v", aLdPort["ip_prefix"][0], err)
+		for _, r := range routeList {
+			if err = c.ovnClient.DeleteLogicalRouterStaticRoute(lr.Name, &r.RouteTable, r.Policy, r.IPPrefix, r.Nexthop); err != nil {
+				klog.Errorf("failed to delete learned static route %#v on logical router %s: %v", r, lr.Name, err)
 				return err
 			}
 		}
-		klog.V(5).Infof("finish removing learned routes")
 	}
+
+	klog.V(5).Infof("finish removing learned routes")
 	return nil
 }
 
@@ -439,18 +430,20 @@ func stripPrefix(policyMatch string) (string, error) {
 	matches := strings.Split(policyMatch, "==")
 	if strings.Trim(matches[0], " ") == util.MatchV4Dst {
 		return strings.Trim(matches[1], " "), nil
+	} else if strings.Trim(matches[0], " ") == util.MatchV6Dst {
+		return strings.Trim(matches[1], " "), nil
 	} else {
 		return "", fmt.Errorf("policy %s is mismatched", policyMatch)
 	}
 }
 
 func (c *Controller) syncOneRouteToPolicy(key, value string) {
-	lr, err := c.ovnClient.GetLogicalRouter(util.DefaultVpc, false)
+	lr, err := c.ovnClient.GetLogicalRouter(c.config.ClusterRouter, false)
 	if err != nil {
 		klog.Errorf("logical router does not exist %v at %v", err, time.Now())
 		return
 	}
-	lrRouteList, err := c.ovnClient.GetLogicalRouterRouteByOpts(key, value)
+	lrRouteList, err := c.ovnClient.ListLogicalRouterStaticRoutesByOption(lr.Name, util.MainRouteTable, key, value)
 	if err != nil {
 		klog.Errorf("failed to list lr ovn-ic route %v", err)
 		return
@@ -459,14 +452,14 @@ func (c *Controller) syncOneRouteToPolicy(key, value string) {
 		klog.V(5).Info("lr ovn-ic route does not exist")
 		err := c.ovnClient.DeleteLogicalRouterPolicies(lr.Name, util.OvnICPolicyPriority, map[string]string{key: value})
 		if err != nil {
-			klog.Errorf("delete ovn-ic lr policy", err)
+			klog.Errorf("failed to delete ovn-ic lr policy: %v", err)
 			return
 		}
 		return
 	}
 
 	policyMap := map[string]string{}
-	lrPolicyList, err := c.ovnClient.ListLogicalRouterPolicies(util.OvnICPolicyPriority, map[string]string{key: value})
+	lrPolicyList, err := c.ovnClient.ListLogicalRouterPolicies(lr.Name, util.OvnICPolicyPriority, map[string]string{key: value})
 	if err != nil {
 		klog.Errorf("failed to list ovn-ic lr policy ", err)
 		return
@@ -483,9 +476,19 @@ func (c *Controller) syncOneRouteToPolicy(key, value string) {
 		if _, ok := policyMap[lrRoute.IPPrefix]; ok {
 			delete(policyMap, lrRoute.IPPrefix)
 		} else {
-			matchFiled := util.MatchV4Dst + " == " + lrRoute.IPPrefix
-			if err := c.ovnClient.AddLogicalRouterPolicy(util.DefaultVpc, util.OvnICPolicyPriority, matchFiled, ovnnb.LogicalRouterPolicyActionAllow, nil, map[string]string{key: value, "vendor": util.CniTypeName}); err != nil {
-				klog.Errorf("adding router policy failed %v", err)
+			var matchFiled string
+			if util.CheckProtocol(lrRoute.IPPrefix) == kubeovnv1.ProtocolIPv4 {
+				matchFiled = util.MatchV4Dst + " == " + lrRoute.IPPrefix
+				if err := c.ovnClient.AddLogicalRouterPolicy(lr.Name, util.OvnICPolicyPriority, matchFiled, ovnnb.LogicalRouterPolicyActionAllow, nil, map[string]string{key: value, "vendor": util.CniTypeName}); err != nil {
+					klog.Errorf("adding router policy failed %v", err)
+				}
+			}
+
+			if util.CheckProtocol(lrRoute.IPPrefix) == kubeovnv1.ProtocolIPv6 {
+				matchFiled = util.MatchV6Dst + " == " + lrRoute.IPPrefix
+				if err := c.ovnClient.AddLogicalRouterPolicy(lr.Name, util.OvnICPolicyPriority, matchFiled, ovnnb.LogicalRouterPolicyActionAllow, nil, map[string]string{key: value, "vendor": util.CniTypeName}); err != nil {
+					klog.Errorf("adding router policy failed %v", err)
+				}
 			}
 		}
 	}
@@ -496,7 +499,7 @@ func (c *Controller) syncOneRouteToPolicy(key, value string) {
 	}
 }
 
-func (c *Controller) listRemoteLogicalSwitchPortAddress() (map[string]struct{}, error) {
+func (c *Controller) listRemoteLogicalSwitchPortAddress() (*strset.Set, error) {
 	lsps, err := c.ovnClient.ListLogicalSwitchPorts(true, nil, func(lsp *ovnnb.LogicalSwitchPort) bool {
 		return lsp.Type == "remote"
 	})
@@ -504,7 +507,7 @@ func (c *Controller) listRemoteLogicalSwitchPortAddress() (map[string]struct{}, 
 		return nil, fmt.Errorf("list remote logical switch ports: %v", err)
 	}
 
-	existAddress := make(map[string]struct{})
+	existAddress := strset.NewWithSize(len(lsps))
 	for _, lsp := range lsps {
 		if len(lsp.Addresses) == 0 {
 			continue
@@ -517,7 +520,7 @@ func (c *Controller) listRemoteLogicalSwitchPortAddress() (map[string]struct{}, 
 			continue
 		}
 
-		existAddress[fields[1]] = struct{}{}
+		existAddress.Add(fields[1])
 	}
 
 	return existAddress, nil

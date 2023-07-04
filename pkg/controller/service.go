@@ -235,6 +235,16 @@ func (c *Controller) processNextUpdateServiceWorkItem() bool {
 }
 
 func (c *Controller) handleDeleteService(service *vpcService) error {
+	key, err := cache.MetaNamespaceKeyFunc(service.Svc)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("failed to get meta namespace key of %#v: %v", service.Svc, err))
+		return nil
+	}
+
+	c.svcKeyMutex.LockKey(key)
+	defer func() { _ = c.svcKeyMutex.UnlockKey(key) }()
+	klog.Infof("handle delete service %s", key)
+
 	svcs, err := c.servicesLister.Services(v1.NamespaceAll).List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list svc, %v", err)
@@ -266,7 +276,7 @@ func (c *Controller) handleDeleteService(service *vpcService) error {
 		}
 
 		for _, lb := range vpcLB {
-			if err := c.ovnLegacyClient.DeleteLoadBalancerVip(vip, lb); err != nil {
+			if err := c.ovnClient.LoadBalancerDeleteVip(lb, vip); err != nil {
 				klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lb, err)
 				return err
 			}
@@ -297,7 +307,11 @@ func (c *Controller) handleUpdateService(key string) error {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
 		return nil
 	}
-	klog.Infof("update svc %s/%s", namespace, name)
+
+	c.svcKeyMutex.LockKey(key)
+	defer func() { _ = c.svcKeyMutex.UnlockKey(key) }()
+	klog.Infof("handle update service %s", key)
+
 	svc, err := c.servicesLister.Services(namespace).Get(name)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -310,7 +324,7 @@ func (c *Controller) handleUpdateService(key string) error {
 
 	vpcName := svc.Annotations[util.VpcAnnotation]
 	if vpcName == "" {
-		vpcName = util.DefaultVpc
+		vpcName = c.config.ClusterRouter
 	}
 	vpc, err := c.vpcsLister.Get(vpcName)
 	if err != nil {
@@ -339,44 +353,55 @@ func (c *Controller) handleUpdateService(key string) error {
 	}
 	needUpdateEndpointQueue := false
 	// for service update
-	updateVip := func(lb, oLb string, svcVips []string) error {
-		vips, err := c.ovnLegacyClient.GetLoadBalancerVips(lb)
+	updateVip := func(lbName, oLbName string, svcVips []string) error {
+		if len(lbName) == 0 {
+			return nil
+		}
+
+		lb, err := c.ovnClient.GetLoadBalancer(lbName, false)
 		if err != nil {
-			klog.Errorf("failed to get vips of LB %s: %v", lb, err)
+			klog.Errorf("failed to get LB %s: %v", lbName, err)
 			return err
 		}
-		klog.V(3).Infof("existing vips of LB %s: %v", lb, vips)
+		klog.V(3).Infof("existing vips of LB %s: %v", lbName, lb.Vips)
 		for _, vip := range svcVips {
-			if err = c.ovnLegacyClient.DeleteLoadBalancerVip(vip, oLb); err != nil {
-				klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLb, err)
+			if err := c.ovnClient.LoadBalancerDeleteVip(oLbName, vip); err != nil {
+				klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLbName, err)
 				return err
 			}
+
 			if !needUpdateEndpointQueue {
-				if _, ok := vips[vip]; !ok {
-					klog.Infof("add vip %s to LB %s", vip, lb)
+				if _, ok := lb.Vips[vip]; !ok {
+					klog.Infof("add vip %s to LB %s", vip, lbName)
 					needUpdateEndpointQueue = true
 				}
 			}
 		}
-		for vip := range vips {
+		for vip := range lb.Vips {
 			if ip := parseVipAddr(vip); (util.ContainsString(ips, ip) && !util.IsStringIn(vip, svcVips)) || util.ContainsString(ipsToDel, ip) {
 				klog.Infof("remove stale vip %s from LB %s", vip, lb)
-				if err = c.ovnLegacyClient.DeleteLoadBalancerVip(vip, lb); err != nil {
+				if err := c.ovnClient.LoadBalancerDeleteVip(lbName, vip); err != nil {
 					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lb, err)
 					return err
 				}
 			}
 		}
-		if vips, err = c.ovnLegacyClient.GetLoadBalancerVips(oLb); err != nil {
-			klog.Errorf("failed to get vips of LB %s: %v", oLb, err)
+
+		if len(oLbName) == 0 {
+			return nil
+		}
+
+		oLb, err := c.ovnClient.GetLoadBalancer(oLbName, false)
+		if err != nil {
+			klog.Errorf("failed to get LB %s: %v", oLbName, err)
 			return err
 		}
-		klog.V(3).Infof("existing vips of LB %s: %v", oLb, vips)
-		for vip := range vips {
+		klog.V(3).Infof("existing vips of LB %s: %v", oLbName, lb.Vips)
+		for vip := range oLb.Vips {
 			if ip := parseVipAddr(vip); util.ContainsString(ips, ip) || util.ContainsString(ipsToDel, ip) {
-				klog.Infof("remove stale vip %s from LB %s", vip, oLb)
-				if err = c.ovnLegacyClient.DeleteLoadBalancerVip(vip, oLb); err != nil {
-					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLb, err)
+				klog.Infof("remove stale vip %s from LB %s", vip, oLbName)
+				if err = c.ovnClient.LoadBalancerDeleteVip(oLbName, vip); err != nil {
+					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oLbName, err)
 					return err
 				}
 			}
@@ -416,6 +441,10 @@ func (c *Controller) handleAddService(key string) error {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
 		return nil
 	}
+
+	c.svcKeyMutex.LockKey(key)
+	defer func() { _ = c.svcKeyMutex.UnlockKey(key) }()
+	klog.Infof("handle add service %s", key)
 
 	svc, err := c.servicesLister.Services(namespace).Get(name)
 	if err != nil {

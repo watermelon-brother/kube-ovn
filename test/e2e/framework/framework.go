@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	attachnetclientset "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/clientset/versioned"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/kubernetes/test/e2e/framework"
 	admissionapi "k8s.io/pod-security-admission/api"
@@ -13,6 +14,12 @@ import (
 	"github.com/onsi/ginkgo/v2"
 
 	kubeovncs "github.com/kubeovn/kube-ovn/pkg/client/clientset/versioned"
+)
+
+const (
+	IPv4 = "ipv4"
+	IPv6 = "ipv6"
+	Dual = "dual"
 )
 
 const (
@@ -26,7 +33,7 @@ type Framework struct {
 	KubeContext string
 	*framework.Framework
 	KubeOVNClientSet kubeovncs.Interface
-
+	AttachNetClient  attachnetclientset.Interface
 	// master/release-1.10/...
 	ClusterVersion string
 	// 999.999 for master
@@ -102,8 +109,24 @@ func NewFrameworkWithContext(baseName, kubeContext string) *Framework {
 	return f
 }
 
-func (f *Framework) IPv6() bool {
-	return f.ClusterIpFamily == "ipv6"
+func (f *Framework) IsIPv4() bool {
+	return f.ClusterIpFamily == IPv4
+}
+
+func (f *Framework) IsIPv6() bool {
+	return f.ClusterIpFamily == IPv6
+}
+
+func (f *Framework) IsDual() bool {
+	return f.ClusterIpFamily == Dual
+}
+
+func (f *Framework) HasIPv4() bool {
+	return !f.IsIPv6()
+}
+
+func (f *Framework) HasIPv6() bool {
+	return !f.IsIPv4()
 }
 
 // BeforeEach gets a kube-ovn client
@@ -122,6 +145,17 @@ func (f *Framework) BeforeEach() {
 		ExpectNoError(err)
 	}
 
+	if f.AttachNetClient == nil {
+		ginkgo.By("Creating a nad client")
+		config, err := framework.LoadConfig()
+		ExpectNoError(err)
+
+		config.QPS = f.Options.ClientQPS
+		config.Burst = f.Options.ClientBurst
+		f.AttachNetClient, err = attachnetclientset.NewForConfig(config)
+		ExpectNoError(err)
+	}
+
 	framework.TestContext.Host = ""
 }
 
@@ -129,9 +163,9 @@ func (f *Framework) VersionPriorTo(major, minor uint) bool {
 	return f.ClusterVersionMajor < major || (f.ClusterVersionMajor == major && f.ClusterVersionMinor < minor)
 }
 
-func (f *Framework) SkipVersionPriorTo(major, minor uint, message string) {
+func (f *Framework) SkipVersionPriorTo(major, minor uint, reason string) {
 	if f.VersionPriorTo(major, minor) {
-		ginkgo.Skip(message)
+		ginkgo.Skip(reason)
 	}
 }
 

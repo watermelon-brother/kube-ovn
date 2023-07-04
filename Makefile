@@ -5,6 +5,7 @@ include Makefile.e2e
 REGISTRY = kubeovn
 DEV_TAG = dev
 RELEASE_TAG = $(shell cat VERSION)
+DEBUG_TAG = $(shell cat VERSION)-debug
 VERSION = $(shell echo $${VERSION:-$(RELEASE_TAG)})
 COMMIT = git-$(shell git rev-parse --short HEAD)
 DATE = $(shell date +"%Y-%m-%d_%H:%M:%S")
@@ -21,10 +22,10 @@ CONTROL_PLANE_TAINTS = node-role.kubernetes.io/master node-role.kubernetes.io/co
 
 CHART_UPGRADE_RESTART_OVS=$(shell echo $${CHART_UPGRADE_RESTART_OVS:-false})
 
-MULTUS_IMAGE = ghcr.io/k8snetworkplumbingwg/multus-cni:stable
-MULTUS_YAML = https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset.yml
+MULTUS_IMAGE = ghcr.io/k8snetworkplumbingwg/multus-cni:snapshot-thick
+MULTUS_YAML = https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/master/deployments/multus-daemonset-thick.yml
 
-KUBEVIRT_VERSION = v0.58.0
+KUBEVIRT_VERSION = v0.58.1
 KUBEVIRT_OPERATOR_IMAGE = quay.io/kubevirt/virt-operator:$(KUBEVIRT_VERSION)
 KUBEVIRT_API_IMAGE = quay.io/kubevirt/virt-api:$(KUBEVIRT_VERSION)
 KUBEVIRT_CONTROLLER_IMAGE = quay.io/kubevirt/virt-controller:$(KUBEVIRT_VERSION)
@@ -35,10 +36,10 @@ KUBEVIRT_OPERATOR_YAML = https://github.com/kubevirt/kubevirt/releases/download/
 KUBEVIRT_CR_YAML = https://github.com/kubevirt/kubevirt/releases/download/$(KUBEVIRT_VERSION)/kubevirt-cr.yaml
 KUBEVIRT_TEST_YAML = https://kubevirt.io/labs/manifests/vm.yaml
 
-CILIUM_VERSION = 1.12.7
+CILIUM_VERSION = 1.12.9
 CILIUM_IMAGE_REPO = quay.io/cilium/cilium
 
-CERT_MANAGER_VERSION = v1.11.0
+CERT_MANAGER_VERSION = v1.11.1
 CERT_MANAGER_CONTROLLER = quay.io/jetstack/cert-manager-controller:$(CERT_MANAGER_VERSION)
 CERT_MANAGER_CAINJECTOR = quay.io/jetstack/cert-manager-cainjector:$(CERT_MANAGER_VERSION)
 CERT_MANAGER_WEBHOOK = quay.io/jetstack/cert-manager-webhook:$(CERT_MANAGER_VERSION)
@@ -82,13 +83,17 @@ build-go-arm:
 
 .PHONY: build-kube-ovn
 build-kube-ovn: build-go
-	docker build -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) -f dist/images/Dockerfile dist/images/
-	docker build -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG)-no-avx512 -f dist/images/Dockerfile.no-avx512 dist/images/
+	docker build -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) -f dist/images/Dockerfile dist/images/
+	docker build -t $(REGISTRY)/kube-ovn:$(DEBUG_TAG) --build-arg BASE_TAG=$(DEBUG_TAG) -f dist/images/Dockerfile dist/images/
 	docker build -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG)-dpdk -f dist/images/Dockerfile.dpdk dist/images/
 
 .PHONY: build-dev
 build-dev: build-go
-	docker build -t $(REGISTRY)/kube-ovn:$(DEV_TAG) -f dist/images/Dockerfile dist/images/
+	docker build -t $(REGISTRY)/kube-ovn:$(DEV_TAG) --build-arg VERSION=$(RELEASE_TAG) -f dist/images/Dockerfile dist/images/
+
+.PHONY: build-debug
+build-debug: build-go
+	docker build -t $(REGISTRY)/kube-ovn:$(DEBUG_TAG) --build-arg BASE_TAG=$(DEBUG_TAG) -f dist/images/Dockerfile dist/images/
 
 .PHONY: build-dpdk
 build-dpdk:
@@ -97,7 +102,7 @@ build-dpdk:
 .PHONY: base-amd64
 base-amd64:
 	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 -t $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-amd64 -o type=docker -f dist/images/Dockerfile.base dist/images/
-	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 --build-arg NO_AVX512=true -t $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-amd64-no-avx512 -o type=docker -f dist/images/Dockerfile.base dist/images/
+	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 --build-arg DEBUG=true -t $(REGISTRY)/kube-ovn-base:$(DEBUG_TAG)-amd64 -o type=docker -f dist/images/Dockerfile.base dist/images/
 
 .PHONY: base-amd64-dpdk
 base-amd64-dpdk:
@@ -106,16 +111,13 @@ base-amd64-dpdk:
 .PHONY: base-arm64
 base-arm64:
 	docker buildx build --platform linux/arm64 --build-arg ARCH=arm64 -t $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-arm64 -o type=docker -f dist/images/Dockerfile.base dist/images/
+	docker buildx build --platform linux/arm64 --build-arg ARCH=arm64 --build-arg DEBUG=true -t $(REGISTRY)/kube-ovn-base:$(DEBUG_TAG)-arm64 -o type=docker -f dist/images/Dockerfile.base dist/images/
 
 .PHONY: image-kube-ovn
 image-kube-ovn: build-go
-	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
-	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG)-no-avx512 -o type=docker -f dist/images/Dockerfile.no-avx512 dist/images/
+	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
+	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(DEBUG_TAG) --build-arg BASE_TAG=$(DEBUG_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
 	docker buildx build --platform linux/amd64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG)-dpdk -o type=docker -f dist/images/Dockerfile.dpdk dist/images/
-
-.PHONY: image-debug
-image-debug: build-go
-	docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 -t $(REGISTRY)/kube-ovn:debug -o type=docker -f dist/images/Dockerfile.debug dist/images/
 
 .PHONY: image-vpc-nat-gateway
 image-vpc-nat-gateway:
@@ -135,7 +137,8 @@ release: lint image-kube-ovn image-vpc-nat-gateway image-centos-compile
 
 .PHONY: release-arm
 release-arm: build-go-arm
-	docker buildx build --platform linux/arm64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
+	docker buildx build --platform linux/arm64 -t $(REGISTRY)/kube-ovn:$(RELEASE_TAG) --build-arg VERSION=$(RELEASE_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
+	docker buildx build --platform linux/arm64 -t $(REGISTRY)/kube-ovn:$(DEBUG_TAG) --build-arg BASE_TAG=$(DEBUG_TAG) -o type=docker -f dist/images/Dockerfile dist/images/
 	docker buildx build --platform linux/arm64 -t $(REGISTRY)/vpc-nat-gateway:$(RELEASE_TAG) -o type=docker -f dist/images/vpcnatgateway/Dockerfile dist/images/vpcnatgateway
 
 .PHONY: push-dev
@@ -148,7 +151,7 @@ push-release: release
 
 .PHONY: tar-kube-ovn
 tar-kube-ovn:
-	docker save $(REGISTRY)/kube-ovn:$(RELEASE_TAG) $(REGISTRY)/kube-ovn:$(RELEASE_TAG)-no-avx512 -o kube-ovn.tar
+	docker save $(REGISTRY)/kube-ovn:$(RELEASE_TAG) $(REGISTRY)/kube-ovn:$(DEBUG_TAG) -o kube-ovn.tar
 
 .PHONY: tar-vpc-nat-gateway
 tar-vpc-nat-gateway:
@@ -164,7 +167,7 @@ tar: tar-kube-ovn tar-vpc-nat-gateway tar-centos-compile
 
 .PHONY: base-tar-amd64
 base-tar-amd64:
-	docker save $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-amd64 $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-amd64-no-avx512 -o image-amd64.tar
+	docker save $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-amd64 $(REGISTRY)/kube-ovn-base:$(DEBUG_TAG)-amd64 -o image-amd64.tar
 
 .PHONY: base-tar-amd64-dpdk
 base-tar-amd64-dpdk:
@@ -172,7 +175,7 @@ base-tar-amd64-dpdk:
 
 .PHONY: base-tar-arm64
 base-tar-arm64:
-	docker save $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-arm64 -o image-arm64.tar
+	docker save $(REGISTRY)/kube-ovn-base:$(RELEASE_TAG)-arm64 $(REGISTRY)/kube-ovn-base:$(DEBUG_TAG)-arm64 -o image-arm64.tar
 
 define docker_ensure_image_exists
 	if ! docker images --format "{{.Repository}}:{{.Tag}}" | grep "^$(1)$$" >/dev/null; then \
@@ -325,8 +328,21 @@ kind-init-ipv4: kind-clean
 	@$(MAKE) kind-create
 
 .PHONY: kind-init-ovn-ic
-kind-init-ovn-ic: kind-clean-ovn-ic kind-init
+kind-init-ovn-ic: kind-init-ovn-ic-ipv4
+
+.PHONY: kind-init-ovn-ic-ipv4
+kind-init-ovn-ic-ipv4: kind-clean-ovn-ic kind-init
 	@$(MAKE) kind-generate-config
+	$(call kind_create_cluster,yamls/kind.yaml,kube-ovn1)
+
+.PHONY: kind-init-ovn-ic-ipv6
+kind-init-ovn-ic-ipv6: kind-clean-ovn-ic kind-init-ipv6
+	@ip_family=ipv6 $(MAKE) kind-generate-config
+	$(call kind_create_cluster,yamls/kind.yaml,kube-ovn1)
+
+.PHONY: kind-init-ovn-ic-dual
+kind-init-ovn-ic-dual: kind-clean-ovn-ic kind-init-dual
+	@ip_family=dual $(MAKE) kind-generate-config
 	$(call kind_create_cluster,yamls/kind.yaml,kube-ovn1)
 
 .PHONY: kind-init-ovn-submariner
@@ -386,7 +402,7 @@ kind-install-chart: kind-load-image kind-untaint-control-plane
 	kubectl label node -lnode-role.kubernetes.io/control-plane kube-ovn/role=master --overwrite
 	kubectl label node -lovn.kubernetes.io/ovs_dp_type!=userspace ovn.kubernetes.io/ovs_dp_type=kernel --overwrite
 	ips=$$(kubectl get node -lkube-ovn/role=master --no-headers -o wide | awk '{print $$6}') && \
-	helm install kubeovn ./kubeovn-helm \
+	helm install kubeovn ./charts \
 		--set global.images.kubeovn.tag=$(VERSION) \
 		--set replicaCount=$$(echo $$ips | awk '{print NF}') \
 		--set MASTER_NODES="$$(echo $$ips | tr \\n ',' | sed -e 's/,$$//' -e 's/,/\\,/g')"
@@ -399,7 +415,7 @@ kind-install-chart: kind-load-image kind-untaint-control-plane
 .PHONY: kind-upgrade-chart
 kind-upgrade-chart: kind-load-image
 	$(eval OVN_DB_IPS = $(shell kubectl get no -lkube-ovn/role=master --no-headers -o wide | awk '{print $$6}' | tr \\n ',' | sed -e 's/,$$//' -e 's/,/\\,/g'))
-	helm upgrade kubeovn ./kubeovn-helm \
+	helm upgrade kubeovn ./charts \
 		--set global.images.kubeovn.tag=$(VERSION) \
 		--set replicaCount=$$(echo $(OVN_DB_IPS) | awk -F ',' '{print NF}') \
 		--set MASTER_NODES='$(OVN_DB_IPS)' \
@@ -421,6 +437,14 @@ kind-install: kind-load-image
 kind-install-dev:
 	@VERSION=$(DEV_TAG) $(MAKE) kind-install
 
+.PHONY: kind-install-debug
+kind-install-debug:
+	@VERSION=$(DEBUG_TAG) $(MAKE) kind-install
+
+.PHONY: kind-install-debug-valgrind
+kind-install-debug-valgrind:
+	@DEBUG_WRAPPER=valgrind $(MAKE) kind-install-debug
+
 .PHONY: kind-install-ipv4
 kind-install-ipv4: kind-install-overlay-ipv4
 
@@ -428,7 +452,10 @@ kind-install-ipv4: kind-install-overlay-ipv4
 kind-install-overlay-ipv4: kind-install
 
 .PHONY: kind-install-ovn-ic
-kind-install-ovn-ic: kind-install
+kind-install-ovn-ic: kind-install-ovn-ic-ipv4
+
+.PHONY: kind-install-ovn-ic-ipv4
+kind-install-ovn-ic-ipv4: kind-install
 	$(call kind_load_image,kube-ovn1,$(REGISTRY)/kube-ovn:$(VERSION))
 	kubectl config use-context kind-kube-ovn1
 	sed -e 's/10.16.0/10.18.0/g' \
@@ -440,6 +467,60 @@ kind-install-ovn-ic: kind-install
 
 	docker run -d --name ovn-ic-db --network kind $(REGISTRY)/kube-ovn:$(VERSION) bash start-ic-db.sh
 	@set -e; \
+	ic_db_host=$$(docker inspect ovn-ic-db -f "{{.NetworkSettings.Networks.kind.IPAddress}}"); \
+	zone=az0 ic_db_host=$$ic_db_host gateway_node_name=kube-ovn-worker j2 yamls/ovn-ic.yaml.j2 -o ovn-ic-0.yaml; \
+	zone=az1 ic_db_host=$$ic_db_host gateway_node_name=kube-ovn1-worker j2 yamls/ovn-ic.yaml.j2 -o ovn-ic-1.yaml
+	kubectl config use-context kind-kube-ovn
+	kubectl apply -f ovn-ic-0.yaml
+	kubectl config use-context kind-kube-ovn1
+	kubectl apply -f ovn-ic-1.yaml
+	sleep 6
+	docker exec ovn-ic-db ovn-ic-sbctl show
+
+.PHONY: kind-install-ovn-ic-ipv6
+kind-install-ovn-ic-ipv6: kind-install-ipv6
+	$(call kind_load_image,kube-ovn1,$(REGISTRY)/kube-ovn:$(VERSION))
+	kubectl config use-context kind-kube-ovn1
+	@$(MAKE) kind-untaint-control-plane
+	sed -e 's/fd00:10:16:/fd00:10:18:/g' \
+		-e 's/fd00:10:96:/fd00:10:98:/g' \
+		-e 's/fd00:100:64:/fd00:100:68:/g' \
+		-e 's/VERSION=.*/VERSION=$(VERSION)/' \
+		dist/images/install.sh | \
+		IPV6=true bash
+	kubectl describe no
+
+	docker run -d --name ovn-ic-db --network kind -e PROTOCOL="ipv6" $(REGISTRY)/kube-ovn:$(VERSION) bash start-ic-db.sh
+	@set -e; \
+	ic_db_host=$$(docker inspect ovn-ic-db -f "{{.NetworkSettings.Networks.kind.GlobalIPv6Address}}"); \
+	zone=az0 ic_db_host=$$ic_db_host gateway_node_name=kube-ovn-worker j2 yamls/ovn-ic.yaml.j2 -o ovn-ic-0.yaml; \
+	zone=az1 ic_db_host=$$ic_db_host gateway_node_name=kube-ovn1-worker j2 yamls/ovn-ic.yaml.j2 -o ovn-ic-1.yaml
+	kubectl config use-context kind-kube-ovn
+	kubectl apply -f ovn-ic-0.yaml
+	kubectl config use-context kind-kube-ovn1
+	kubectl apply -f ovn-ic-1.yaml
+	sleep 6
+	docker exec ovn-ic-db ovn-ic-sbctl show
+
+.PHONY: kind-install-ovn-ic-dual
+kind-install-ovn-ic-dual: kind-install-dual
+	$(call kind_load_image,kube-ovn1,$(REGISTRY)/kube-ovn:$(VERSION))
+	kubectl config use-context kind-kube-ovn1
+	@$(MAKE) kind-untaint-control-plane
+	sed -e 's/10.16.0/10.18.0/g' \
+		-e 's/10.96.0/10.98.0/g' \
+		-e 's/100.64.0/100.68.0/g' \
+	    -e 's/fd00:10:16:/fd00:10:18:/g' \
+		-e 's/fd00:10:96:/fd00:10:98:/g' \
+		-e 's/fd00:100:64:/fd00:100:68:/g' \
+		-e 's/VERSION=.*/VERSION=$(VERSION)/' \
+		dist/images/install.sh | \
+		DUAL_STACK=true bash
+	kubectl describe no
+
+	docker run -d --name ovn-ic-db --network kind -e PROTOCOL="dual" $(REGISTRY)/kube-ovn:$(VERSION) bash start-ic-db.sh
+	@set -e; \
+
 	ic_db_host=$$(docker inspect ovn-ic-db -f "{{.NetworkSettings.Networks.kind.IPAddress}}"); \
 	zone=az0 ic_db_host=$$ic_db_host gateway_node_name=kube-ovn-worker j2 yamls/ovn-ic.yaml.j2 -o ovn-ic-0.yaml; \
 	zone=az1 ic_db_host=$$ic_db_host gateway_node_name=kube-ovn1-worker j2 yamls/ovn-ic.yaml.j2 -o ovn-ic-1.yaml
@@ -591,6 +672,12 @@ kind-install-multus:
 	kubectl apply -f "$(MULTUS_YAML)"
 	kubectl -n kube-system rollout status ds kube-multus-ds
 
+.PHONY: kind-install-vpc-nat-gw
+kind-install-vpc-nat-gw: kind-load-image kind-untaint-control-plane
+	$(call kind_load_image,kube-ovn,$(VPC_NAT_GW_IMG))
+	@$(MAKE) ENABLE_NAT_GW=true CNI_CONFIG_PRIORITY=10 kind-install
+	@$(MAKE) kind-install-multus
+
 .PHONY: kind-install-kubevirt
 kind-install-kubevirt: kind-load-image kind-untaint-control-plane
 	$(call kind_load_image,kube-ovn,$(KUBEVIRT_OPERATOR_IMAGE),1)
@@ -617,10 +704,9 @@ kind-install-kubevirt: kind-load-image kind-untaint-control-plane
 .PHONY: kind-install-lb-svc
 kind-install-lb-svc: kind-load-image kind-untaint-control-plane
 	$(call kind_load_image,kube-ovn,$(VPC_NAT_GW_IMG))
+	@$(MAKE) ENABLE_LB_SVC=true CNI_CONFIG_PRIORITY=10 kind-install
+	@$(MAKE) kind-install-multus
 	kubectl apply -f yamls/lb-svc-attachment.yaml
-	sed 's/VERSION=.*/VERSION=$(VERSION)/' dist/images/install.sh | \
-	ENABLE_LB_SVC=true CNI_CONFIG_PRIORITY=10 bash
-	kubectl describe no
 
 .PHONY: kind-install-webhook
 kind-install-webhook: kind-install
@@ -709,7 +795,7 @@ scan:
 
 .PHONY: ut
 ut:
-	ginkgo -mod=mod -progress --always-emit-ginkgo-writer --slow-spec-threshold=60s test/unittest
+	ginkgo -mod=mod --show-node-events --poll-progress-after=60s -v test/unittest
 	go test ./pkg/...
 
 .PHONY: ipam-bench

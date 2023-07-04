@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -91,7 +90,10 @@ func (c *Controller) handleUpdateEndpoint(key string) error {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
 		return nil
 	}
-	klog.Infof("update endpoint %s/%s", namespace, name)
+
+	c.epKeyMutex.LockKey(key)
+	defer func() { _ = c.epKeyMutex.UnlockKey(key) }()
+	klog.Infof("update add/update endpoint %s/%s", namespace, name)
 
 	ep, err := c.endpointsLister.Endpoints(namespace).Get(name)
 	if err != nil {
@@ -148,7 +150,7 @@ func (c *Controller) handleUpdateEndpoint(key string) error {
 
 	if vpcName == "" {
 		if vpcName = svc.Annotations[util.VpcAnnotation]; vpcName == "" {
-			vpcName = util.DefaultVpc
+			vpcName = c.config.ClusterRouter
 		}
 	}
 
@@ -192,18 +194,18 @@ func (c *Controller) handleUpdateEndpoint(key string) error {
 
 			// for performance reason delete lb with no backends
 			if len(backends) != 0 {
-				err = c.ovnLegacyClient.CreateLoadBalancerRule(lb, vip, backends, string(port.Protocol))
-				if err != nil {
+				if err = c.ovnClient.LoadBalancerAddVip(lb, vip, backends...); err != nil {
 					klog.Errorf("failed to add vip %s with backends %s to LB %s: %v", vip, backends, lb, err)
 					return err
 				}
 			} else {
-				if err = c.ovnLegacyClient.DeleteLoadBalancerVip(vip, lb); err != nil {
+				if err := c.ovnClient.LoadBalancerDeleteVip(lb, vip); err != nil {
 					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lb, err)
 					return err
 				}
-				if err = c.ovnLegacyClient.DeleteLoadBalancerVip(vip, oldLb); err != nil {
-					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, oldLb, err)
+
+				if err := c.ovnClient.LoadBalancerDeleteVip(oldLb, vip); err != nil {
+					klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lb, err)
 					return err
 				}
 			}
@@ -213,7 +215,7 @@ func (c *Controller) handleUpdateEndpoint(key string) error {
 	return nil
 }
 
-func getServicePortBackends(endpoints *v1.Endpoints, pods []*v1.Pod, servicePort v1.ServicePort, serviceIP string) string {
+func getServicePortBackends(endpoints *v1.Endpoints, pods []*v1.Pod, servicePort v1.ServicePort, serviceIP string) []string {
 	backends := []string{}
 	protocol := util.CheckProtocol(serviceIP)
 	for _, subset := range endpoints.Subsets {
@@ -261,5 +263,5 @@ func getServicePortBackends(endpoints *v1.Endpoints, pods []*v1.Pod, servicePort
 		}
 	}
 
-	return strings.Join(backends, ",")
+	return backends
 }

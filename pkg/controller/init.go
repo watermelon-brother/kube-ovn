@@ -2,10 +2,12 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/scylladb/go-set/strset"
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,10 +60,10 @@ func (c *Controller) InitOVN() error {
 }
 
 func (c *Controller) InitDefaultVpc() error {
-	cachedVpc, err := c.vpcsLister.Get(util.DefaultVpc)
+	cachedVpc, err := c.vpcsLister.Get(c.config.ClusterRouter)
 	if err != nil {
 		cachedVpc = &kubeovnv1.Vpc{}
-		cachedVpc.Name = util.DefaultVpc
+		cachedVpc.Name = c.config.ClusterRouter
 		cachedVpc, err = c.config.KubeOvnClient.KubeovnV1().Vpcs().Create(context.Background(), cachedVpc, metav1.CreateOptions{})
 		if err != nil {
 			klog.Errorf("init default vpc failed: %v", err)
@@ -96,14 +98,14 @@ func (c *Controller) InitDefaultVpc() error {
 
 // InitDefaultLogicalSwitch init the default logical switch for ovn network
 func (c *Controller) initDefaultLogicalSwitch() error {
-	subnet, err := c.config.KubeOvnClient.KubeovnV1().Subnets().Get(context.Background(), c.config.DefaultLogicalSwitch, metav1.GetOptions{})
+	subnet, err := c.subnetsLister.Get(c.config.DefaultLogicalSwitch)
 	if err == nil {
 		if subnet != nil && util.CheckProtocol(c.config.DefaultCIDR) != util.CheckProtocol(subnet.Spec.CIDRBlock) {
 			// single-stack upgrade to dual-stack
 			if util.CheckProtocol(c.config.DefaultCIDR) == kubeovnv1.ProtocolDual {
 				subnet := subnet.DeepCopy()
 				subnet.Spec.CIDRBlock = c.config.DefaultCIDR
-				if err := formatSubnet(subnet, c); err != nil {
+				if _, err = formatSubnet(subnet, c); err != nil {
 					klog.Errorf("init format subnet %s failed: %v", c.config.DefaultLogicalSwitch, err)
 					return err
 				}
@@ -120,7 +122,7 @@ func (c *Controller) initDefaultLogicalSwitch() error {
 	defaultSubnet := kubeovnv1.Subnet{
 		ObjectMeta: metav1.ObjectMeta{Name: c.config.DefaultLogicalSwitch},
 		Spec: kubeovnv1.SubnetSpec{
-			Vpc:                 util.DefaultVpc,
+			Vpc:                 c.config.ClusterRouter,
 			Default:             true,
 			Provider:            util.OvnProvider,
 			CIDRBlock:           c.config.DefaultCIDR,
@@ -151,13 +153,13 @@ func (c *Controller) initDefaultLogicalSwitch() error {
 
 // InitNodeSwitch init node switch to connect host and pod
 func (c *Controller) initNodeSwitch() error {
-	subnet, err := c.config.KubeOvnClient.KubeovnV1().Subnets().Get(context.Background(), c.config.NodeSwitch, metav1.GetOptions{})
+	subnet, err := c.subnetsLister.Get(c.config.NodeSwitch)
 	if err == nil {
 		if util.CheckProtocol(c.config.NodeSwitchCIDR) == kubeovnv1.ProtocolDual && util.CheckProtocol(subnet.Spec.CIDRBlock) != kubeovnv1.ProtocolDual {
 			// single-stack upgrade to dual-stack
 			subnet := subnet.DeepCopy()
 			subnet.Spec.CIDRBlock = c.config.NodeSwitchCIDR
-			if err := formatSubnet(subnet, c); err != nil {
+			if _, err = formatSubnet(subnet, c); err != nil {
 				klog.Errorf("init format subnet %s failed: %v", c.config.NodeSwitch, err)
 				return err
 			}
@@ -175,7 +177,7 @@ func (c *Controller) initNodeSwitch() error {
 	nodeSubnet := kubeovnv1.Subnet{
 		ObjectMeta: metav1.ObjectMeta{Name: c.config.NodeSwitch},
 		Spec: kubeovnv1.SubnetSpec{
-			Vpc:                    util.DefaultVpc,
+			Vpc:                    c.config.ClusterRouter,
 			Default:                false,
 			Provider:               util.OvnProvider,
 			CIDRBlock:              c.config.NodeSwitchCIDR,
@@ -202,26 +204,19 @@ func (c *Controller) initClusterRouter() error {
 
 func (c *Controller) initLB(name, protocol string, sessionAffinity bool) error {
 	protocol = strings.ToLower(protocol)
-	uuid, err := c.ovnLegacyClient.FindLoadbalancer(name)
-	if err != nil {
-		return fmt.Errorf("failed to find %s LB: %v", protocol, err)
+
+	var selectFields string
+	if sessionAffinity {
+		selectFields = string(ovnnb.LoadBalancerSelectionFieldsIPSrc)
 	}
-	if uuid == "" {
-		klog.Infof("init cluster %s load balancer %s", protocol, name)
-		var selectFields string
-		if sessionAffinity {
-			selectFields = string(ovnnb.LoadBalancerSelectionFieldsIPSrc)
-		}
-		if err = c.ovnLegacyClient.CreateLoadBalancer(name, protocol, selectFields); err != nil {
-			klog.Errorf("failed to create cluster %s load balancer: %v", protocol, err)
-			return err
-		}
-	} else {
-		klog.Infof("%s load balancer %s already exists: uuid = %s", protocol, name, uuid)
+
+	if err := c.ovnClient.CreateLoadBalancer(name, protocol, selectFields); err != nil {
+		klog.Errorf("create load balancer %s: %v", name, err)
+		return err
 	}
 
 	if sessionAffinity {
-		if err = c.ovnLegacyClient.SetLoadBalancerAffinityTimeout(name, util.DefaultServiceSessionStickinessTimeout); err != nil {
+		if err := c.ovnClient.SetLoadBalancerAffinityTimeout(name, util.DefaultServiceSessionStickinessTimeout); err != nil {
 			klog.Errorf("failed to set affinity timeout of %s load balancer %s: %v", protocol, name, err)
 			return err
 		}
@@ -232,13 +227,13 @@ func (c *Controller) initLB(name, protocol string, sessionAffinity bool) error {
 
 // InitLoadBalancer init the default tcp and udp cluster loadbalancer
 func (c *Controller) initLoadBalancer() error {
-	vpcs, err := c.config.KubeOvnClient.KubeovnV1().Vpcs().List(context.Background(), metav1.ListOptions{})
+	vpcs, err := c.vpcsLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list vpc: %v", err)
 		return err
 	}
 
-	for _, cachedVpc := range vpcs.Items {
+	for _, cachedVpc := range vpcs {
 		vpc := cachedVpc.DeepCopy()
 		vpcLb := c.GenVpcLoadBalancer(vpc.Name)
 		if err = c.initLB(vpcLb.TcpLoadBalancer, string(v1.ProtocolTCP), false); err != nil {
@@ -293,9 +288,20 @@ func (c *Controller) InitIPAM() error {
 		u2oInterconnName := fmt.Sprintf(util.U2OInterconnName, subnet.Spec.Vpc, subnet.Name)
 		u2oInterconnLrpName := fmt.Sprintf("%s-%s", subnet.Spec.Vpc, subnet.Name)
 		if subnet.Status.U2OInterconnectionIP != "" {
-			if _, _, _, err = c.ipam.GetStaticAddress(u2oInterconnName, u2oInterconnLrpName, subnet.Status.U2OInterconnectionIP, "", subnet.Name, true); err != nil {
+			if _, _, _, err = c.ipam.GetStaticAddress(u2oInterconnName, u2oInterconnLrpName, subnet.Status.U2OInterconnectionIP, nil, subnet.Name, true); err != nil {
 				klog.Errorf("failed to init subnet u2o interonnection ip to ipam %v", subnet.Name, err)
 			}
+		}
+	}
+
+	ippools, err := c.ippoolLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list ippool: %v", err)
+		return err
+	}
+	for _, ippool := range ippools {
+		if err = c.ipam.AddOrUpdateIPPool(ippool.Spec.Subnet, ippool.Name, ippool.Spec.IPs); err != nil {
+			klog.Errorf("failed to init ippool %s: %v", ippool.Name, err)
 		}
 	}
 
@@ -304,12 +310,9 @@ func (c *Controller) InitIPAM() error {
 		klog.Errorf("failed to list LS: %v", err)
 		return err
 	}
-	lsPortsMap := make(map[string]map[string]struct{}, len(lsList))
+	lsPortsMap := make(map[string]*strset.Set, len(lsList))
 	for _, ls := range lsList {
-		lsPortsMap[ls.Name] = make(map[string]struct{}, len(ls.Ports))
-		for _, port := range ls.Ports {
-			lsPortsMap[ls.Name][port] = struct{}{}
-		}
+		lsPortsMap[ls.Name] = strset.New(ls.Ports...)
 	}
 
 	lspList, err := c.ovnClient.ListLogicalSwitchPortsWithLegacyExternalIDs()
@@ -317,11 +320,11 @@ func (c *Controller) InitIPAM() error {
 		klog.Errorf("failed to list LSP: %v", err)
 		return err
 	}
-	lspWithoutVendor := make(map[string]struct{}, len(lspList))
+	lspWithoutVendor := strset.NewWithSize(len(lspList))
 	lspWithoutLS := make(map[string]string, len(lspList))
 	for _, lsp := range lspList {
 		if len(lsp.ExternalIDs) == 0 || lsp.ExternalIDs["vendor"] == "" {
-			lspWithoutVendor[lsp.Name] = struct{}{}
+			lspWithoutVendor.Add(lsp.Name)
 		}
 		if len(lsp.ExternalIDs) == 0 || lsp.ExternalIDs[logicalSwitchKey] == "" {
 			lspWithoutLS[lsp.Name] = lsp.UUID
@@ -354,7 +357,7 @@ func (c *Controller) InitIPAM() error {
 		} else {
 			ipamKey = fmt.Sprintf("node-%s", ip.Spec.PodName)
 		}
-		if _, _, _, err = c.ipam.GetStaticAddress(ipamKey, ip.Name, ip.Spec.IPAddress, ip.Spec.MacAddress, ip.Spec.Subnet, true); err != nil {
+		if _, _, _, err = c.ipam.GetStaticAddress(ipamKey, ip.Name, ip.Spec.IPAddress, &ip.Spec.MacAddress, ip.Spec.Subnet, true); err != nil {
 			klog.Errorf("failed to init IPAM from IP CR %s: %v", ip.Name, err)
 		}
 	}
@@ -384,34 +387,34 @@ func (c *Controller) InitIPAM() error {
 				portName := ovs.PodNameToPortName(podName, pod.Namespace, podNet.ProviderName)
 				ip := pod.Annotations[fmt.Sprintf(util.IpAddressAnnotationTemplate, podNet.ProviderName)]
 				mac := pod.Annotations[fmt.Sprintf(util.MacAddressAnnotationTemplate, podNet.ProviderName)]
-				subnet := pod.Annotations[fmt.Sprintf(util.LogicalSwitchAnnotationTemplate, podNet.ProviderName)]
-				_, _, _, err := c.ipam.GetStaticAddress(key, portName, ip, mac, subnet, true)
+				_, _, _, err := c.ipam.GetStaticAddress(key, portName, ip, &mac, podNet.Subnet.Name, true)
 				if err != nil {
 					klog.Errorf("failed to init pod %s.%s address %s: %v", podName, pod.Namespace, pod.Annotations[fmt.Sprintf(util.IpAddressAnnotationTemplate, podNet.ProviderName)], err)
 				} else {
 					ipCR := ipsMap[portName]
-					err = c.createOrUpdateCrdIPs(podName, ip, mac, subnet, pod.Namespace, pod.Spec.NodeName, podNet.ProviderName, podType, &ipCR)
+					err = c.createOrUpdateCrdIPs(podName, ip, mac, podNet.Subnet.Name, pod.Namespace, pod.Spec.NodeName, podNet.ProviderName, podType, &ipCR)
 					if err != nil {
 						klog.Errorf("failed to create/update ips CR %s.%s with ip address %s: %v", podName, pod.Namespace, ip, err)
 					}
 				}
-
-				externalIDs := make(map[string]string, 3)
-				if _, ok := lspWithoutVendor[portName]; ok {
-					externalIDs["vendor"] = util.CniTypeName
-					externalIDs["pod"] = fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
-				}
-				if uuid := lspWithoutLS[portName]; uuid != "" {
-					for ls, ports := range lsPortsMap {
-						if _, ok := ports[uuid]; ok {
-							externalIDs[logicalSwitchKey] = ls
-							break
+				if podNet.ProviderName == util.OvnProvider || strings.HasSuffix(podNet.ProviderName, util.OvnProvider) {
+					externalIDs := make(map[string]string, 3)
+					if lspWithoutVendor.Has(portName) {
+						externalIDs["vendor"] = util.CniTypeName
+						externalIDs["pod"] = fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
+					}
+					if uuid := lspWithoutLS[portName]; uuid != "" {
+						for ls, ports := range lsPortsMap {
+							if ports.Has(uuid) {
+								externalIDs[logicalSwitchKey] = ls
+								break
+							}
 						}
 					}
-				}
 
-				if err = c.initAppendLspExternalIds(portName, externalIDs); err != nil {
-					klog.Errorf("failed to append external-ids for logical switch port %s: %v", portName, err)
+					if err = c.initAppendLspExternalIds(portName, externalIDs); err != nil {
+						klog.Errorf("failed to append external-ids for logical switch port %s: %v", portName, err)
+					}
 				}
 			}
 		}
@@ -429,7 +432,7 @@ func (c *Controller) InitIPAM() error {
 		} else {
 			ipamKey = vip.Name
 		}
-		if _, _, _, err = c.ipam.GetStaticAddress(ipamKey, vip.Name, vip.Status.V4ip, vip.Status.Mac, vip.Spec.Subnet, true); err != nil {
+		if _, _, _, err = c.ipam.GetStaticAddress(ipamKey, vip.Name, vip.Status.V4ip, &vip.Status.Mac, vip.Spec.Subnet, true); err != nil {
 			klog.Errorf("failed to init ipam from vip cr %s: %v", vip.Name, err)
 		}
 	}
@@ -440,7 +443,8 @@ func (c *Controller) InitIPAM() error {
 		return err
 	}
 	for _, eip := range eips {
-		if _, _, _, err = c.ipam.GetStaticAddress(eip.Name, eip.Name, eip.Status.IP, eip.Spec.MacAddress, util.VpcExternalNet, true); err != nil {
+		externalNetwork := util.GetExternalNetwork(eip.Spec.ExternalSubnet)
+		if _, _, _, err = c.ipam.GetStaticAddress(eip.Name, eip.Name, eip.Status.IP, &eip.Spec.MacAddress, externalNetwork, true); err != nil {
 			klog.Errorf("failed to init ipam from iptables eip cr %s: %v", eip.Name, err)
 		}
 	}
@@ -450,7 +454,7 @@ func (c *Controller) InitIPAM() error {
 		return err
 	}
 	for _, oeip := range oeips {
-		if _, _, _, err = c.ipam.GetStaticAddress(oeip.Name, oeip.Name, oeip.Status.V4Ip, oeip.Status.MacAddress, oeip.Spec.ExternalSubnet, true); err != nil {
+		if _, _, _, err = c.ipam.GetStaticAddress(oeip.Name, oeip.Name, oeip.Status.V4Ip, &oeip.Status.MacAddress, oeip.Spec.ExternalSubnet, true); err != nil {
 			klog.Errorf("failed to init ipam from ovn eip cr %s: %v", oeip.Name, err)
 		}
 	}
@@ -462,9 +466,9 @@ func (c *Controller) InitIPAM() error {
 	for _, node := range nodes {
 		if node.Annotations[util.AllocatedAnnotation] == "true" {
 			portName := fmt.Sprintf("node-%s", node.Name)
+			mac := node.Annotations[util.MacAddressAnnotation]
 			v4IP, v6IP, _, err := c.ipam.GetStaticAddress(portName, portName,
-				node.Annotations[util.IpAddressAnnotation],
-				node.Annotations[util.MacAddressAnnotation],
+				node.Annotations[util.IpAddressAnnotation], &mac,
 				node.Annotations[util.LogicalSwitchAnnotation], true)
 			if err != nil {
 				klog.Errorf("failed to init node %s.%s address %s: %v", node.Name, node.Namespace, node.Annotations[util.IpAddressAnnotation], err)
@@ -474,12 +478,12 @@ func (c *Controller) InitIPAM() error {
 			}
 
 			externalIDs := make(map[string]string, 2)
-			if _, ok := lspWithoutVendor[portName]; ok {
+			if lspWithoutVendor.Has(portName) {
 				externalIDs["vendor"] = util.CniTypeName
 			}
 			if uuid := lspWithoutLS[portName]; uuid != "" {
 				for ls, ports := range lsPortsMap {
-					if _, ok := ports[uuid]; ok {
+					if ports.Has(uuid) {
 						externalIDs[logicalSwitchKey] = ls
 						break
 					}
@@ -619,7 +623,7 @@ func (c *Controller) initDefaultVlan() error {
 
 func (c *Controller) initSyncCrdIPs() error {
 	klog.Info("start to sync ips")
-	ips, err := c.config.KubeOvnClient.KubeovnV1().IPs().List(context.Background(), metav1.ListOptions{})
+	ips, err := c.ipsLister.List(labels.Everything())
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
@@ -627,16 +631,12 @@ func (c *Controller) initSyncCrdIPs() error {
 		return err
 	}
 
-	vmLsps := c.getVmLsps()
-	ipMap := make(map[string]struct{}, len(vmLsps))
-	for _, vmLsp := range vmLsps {
-		ipMap[vmLsp] = struct{}{}
-	}
+	ipMap := strset.New(c.getVmLsps()...)
 
-	for _, ipCr := range ips.Items {
+	for _, ipCr := range ips {
 		ip := ipCr.DeepCopy()
 		changed := false
-		if _, ok := ipMap[ip.Name]; ok && ip.Spec.PodType == "" {
+		if ipMap.Has(ip.Name) && ip.Spec.PodType == "" {
 			ip.Spec.PodType = util.Vm
 			changed = true
 		}
@@ -680,7 +680,7 @@ func (c *Controller) initSyncCrdSubnets() error {
 
 		// only sync subnet spec enableEcmp when subnet.Spec.EnableEcmp is false and c.config.EnableEcmp is true
 		if subnet.Spec.GatewayType == kubeovnv1.GWCentralizedType && !subnet.Spec.EnableEcmp && subnet.Spec.EnableEcmp != c.config.EnableEcmp {
-			subnet, err = c.config.KubeOvnClient.KubeovnV1().Subnets().Get(context.Background(), subnet.Name, metav1.GetOptions{})
+			subnet, err = c.subnetsLister.Get(subnet.Name)
 			if err != nil {
 				klog.Errorf("failed to get subnet %s: %v", subnet.Name, err)
 				return err
@@ -698,21 +698,39 @@ func (c *Controller) initSyncCrdSubnets() error {
 
 func (c *Controller) initSyncCrdVpcNatGw() error {
 	klog.Info("start to sync crd vpc nat gw")
+	// get vpc nat gateway enable state
 	cm, err := c.configMapsLister.ConfigMaps(c.config.PodNamespace).Get(util.VpcNatGatewayConfig)
 	if err != nil && !k8serrors.IsNotFound(err) {
-		klog.Errorf("failed to get ovn-vpc-nat-gw-config, %v", err)
+		klog.Errorf("failed to get %s, %v", util.VpcNatGatewayConfig, err)
 		return err
 	}
-	if k8serrors.IsNotFound(err) || cm.Data["enable-vpc-nat-gw"] == "false" || cm.Data["image"] == "" {
+	if k8serrors.IsNotFound(err) || cm.Data["enable-vpc-nat-gw"] == "false" {
 		return nil
 	}
+	// get vpc nat gateway image
+	cm, err = c.configMapsLister.ConfigMaps(c.config.PodNamespace).Get(util.VpcNatConfig)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			klog.Errorf("configMap of %s not set, %v", util.VpcNatConfig, err)
+			return err
+		}
+		klog.Errorf("failed to get %s, %v", util.VpcNatConfig, err)
+		return err
+	}
+
+	if cm.Data["image"] == "" {
+		err = errors.New("image of vpc-nat-gateway not set")
+		klog.Error(err)
+		return err
+	}
+
 	gws, err := c.vpcNatGatewayLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list vpc nat gateway, %v", err)
 		return err
 	}
 	for _, gw := range gws {
-		if err := c.updateCrdNatGw(gw.Name); err != nil {
+		if err := c.updateCrdNatGwLabels(gw.Name, ""); err != nil {
 			klog.Errorf("failed to update nat gw: %v", gw.Name, err)
 			return err
 		}
@@ -755,42 +773,35 @@ func (c *Controller) initSyncCrdVlans() error {
 }
 
 func (c *Controller) migrateNodeRoute(af int, node, ip, nexthop string) error {
-	// migrate from old version static route to policy route
 	match := fmt.Sprintf("ip%d.dst == %s", af, ip)
-	consistent, err := c.ovnLegacyClient.CheckPolicyRouteNexthopConsistent(match, nexthop, util.NodeRouterPolicyPriority)
-	if err != nil {
+	action := ovnnb.LogicalRouterPolicyActionReroute
+	externalIDs := map[string]string{
+		"vendor": util.CniTypeName,
+		"node":   node,
+	}
+	klog.V(3).Infof("add policy route for router: %s, priority: %d, match %s, action %s, nexthop %s, extrenalID %v",
+		c.config.ClusterRouter, util.NodeRouterPolicyPriority, match, action, nexthop, externalIDs)
+	if err := c.ovnClient.AddLogicalRouterPolicy(c.config.ClusterRouter, util.NodeRouterPolicyPriority, match, action, []string{nexthop}, externalIDs); err != nil {
+		klog.Errorf("failed to add logical router policy for node %s: %v", node, err)
 		return err
 	}
-	if consistent {
-		klog.V(3).Infof("node policy route migrated")
-		return nil
-	}
-	if err := c.ovnLegacyClient.DeleteStaticRoute(ip, c.config.ClusterRouter); err != nil {
+
+	routeTable := util.MainRouteTable
+	if err := c.ovnClient.DeleteLogicalRouterStaticRoute(c.config.ClusterRouter, &routeTable, nil, ip, ""); err != nil {
 		klog.Errorf("failed to delete obsolete static route for node %s: %v", node, err)
 		return err
 	}
 
 	asName := nodeUnderlayAddressSetName(node, af)
 	obsoleteMatch := fmt.Sprintf("ip%d.dst == %s && ip%d.src != $%s", af, ip, af, asName)
-	klog.Infof("delete policy route for router: %s, priority: %d, match %s", c.config.ClusterRouter, util.NodeRouterPolicyPriority, obsoleteMatch)
-	if err := c.ovnLegacyClient.DeletePolicyRoute(c.config.ClusterRouter, util.NodeRouterPolicyPriority, obsoleteMatch); err != nil {
+	klog.V(3).Infof("delete policy route for router: %s, priority: %d, match %s", c.config.ClusterRouter, util.NodeRouterPolicyPriority, obsoleteMatch)
+	if err := c.ovnClient.DeleteLogicalRouterPolicy(c.config.ClusterRouter, util.NodeRouterPolicyPriority, obsoleteMatch); err != nil {
 		klog.Errorf("failed to delete obsolete logical router policy for node %s: %v", node, err)
 		return err
 	}
 
-	if err := c.ovnLegacyClient.DeleteAddressSet(asName); err != nil {
-		klog.Errorf("failed to delete obsolete address set %s for node %s: %v", asName, node, err)
-		return err
-	}
-
-	externalIDs := map[string]string{
-		"vendor": util.CniTypeName,
-		"node":   node,
-	}
-	klog.Infof("add policy route for router: %s, priority: %d, match %s, action %s, nexthop %s, extrenalID %v",
-		c.config.ClusterRouter, util.NodeRouterPolicyPriority, match, "reroute", nexthop, externalIDs)
-	if err := c.ovnLegacyClient.AddPolicyRoute(c.config.ClusterRouter, util.NodeRouterPolicyPriority, match, "reroute", nexthop, externalIDs); err != nil {
-		klog.Errorf("failed to add logical router policy for node %s: %v", node, err)
+	if err := c.ovnClient.DeleteAddressSet(asName); err != nil {
+		klog.Errorf("delete obsolete address set %s for node %s: %v", asName, node, err)
 		return err
 	}
 

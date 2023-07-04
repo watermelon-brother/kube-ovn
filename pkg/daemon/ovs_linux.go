@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Mellanox/sriovnet"
-	sriovutilfs "github.com/Mellanox/sriovnet/pkg/utils/filesystem"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/utils/sysctl"
+	"github.com/k8snetworkplumbingwg/sriovnet"
+	sriovutilfs "github.com/k8snetworkplumbingwg/sriovnet/pkg/utils/filesystem"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -83,6 +83,7 @@ func (csh cniServerHandler) configureNic(podName, podNamespace, provider, netns,
 	// Add veth pair host end to ovs port
 	output, err := ovs.Exec(ovs.MayExist, "add-port", "br-int", hostNicName, "--",
 		"set", "interface", hostNicName, fmt.Sprintf("external_ids:iface-id=%s", ifaceID),
+		fmt.Sprintf("external_ids:vendor=%s", util.CniTypeName),
 		fmt.Sprintf("external_ids:pod_name=%s", podName),
 		fmt.Sprintf("external_ids:pod_namespace=%s", podNamespace),
 		fmt.Sprintf("external_ids:ip=%s", ipStr),
@@ -362,10 +363,13 @@ func waitNetworkReady(nic, ipAddr, gateway string, underlayGateway, verbose bool
 				klog.Infof("MAC addresses of gateway %s is %s", gw, mac.String())
 				klog.Infof("network %s with gateway %s is ready for interface %s after %d checks", ips[i], gw, nic, count)
 			}
+			maxRetry -= count
 		} else {
-			if err := pingGateway(gw, src, verbose, maxRetry); err != nil {
+			count, err := pingGateway(gw, src, verbose, maxRetry)
+			if err != nil {
 				return err
 			}
+			maxRetry -= count
 		}
 	}
 	return nil
@@ -843,6 +847,12 @@ func configureNic(link, ip string, macAddr net.HardwareAddr, mtu int, detectIPCo
 				return fmt.Errorf("IP address %s has already been used by host with MAC %s", ip, mac)
 			}
 		}
+		if addr.IP.To4() != nil && !detectIPConflict {
+			// when detectIPConflict is true, free arp is already broadcast in the step of announcement
+			if err := util.AnnounceArpAddress(link, addr.IP.String(), macAddr, 1, 1*time.Second); err != nil {
+				klog.Warningf("failed to broadcast free arp with err %v ", err)
+			}
+		}
 
 		klog.Infof("add ip address %s to %s", ip, link)
 		if err = netlink.AddrAdd(nodeLink, &addr); err != nil {
@@ -872,9 +882,7 @@ func configureLoNic() error {
 	return nil
 }
 
-// Add host nic to external bridge
-// Mac address, MTU, IP addresses & routes will be copied/transferred to the external bridge
-func configProviderNic(nicName, brName string) (int, error) {
+func (c *Controller) transferAddrsAndRoutes(nicName, brName string, delNonExistent bool) (int, error) {
 	nic, err := netlink.LinkByName(nicName)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get nic by name %s: %v", nicName, err)
@@ -882,17 +890,6 @@ func configProviderNic(nicName, brName string) (int, error) {
 	bridge, err := netlink.LinkByName(brName)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get bridge by name %s: %v", brName, err)
-	}
-
-	sysctlDisableIPv6 := fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6", brName)
-	disableIPv6, err := sysctl.Sysctl(sysctlDisableIPv6)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get sysctl %s: %v", sysctlDisableIPv6, err)
-	}
-	if disableIPv6 != "0" {
-		if _, err = sysctl.Sysctl(sysctlDisableIPv6, "0"); err != nil {
-			return 0, fmt.Errorf("failed to enable ipv6 on OVS bridge %s: %v", brName, err)
-		}
 	}
 
 	addrs, err := netlink.AddrList(nic, netlink.FAMILY_ALL)
@@ -904,9 +901,39 @@ func configProviderNic(nicName, brName string) (int, error) {
 		return 0, fmt.Errorf("failed to get routes on nic %s: %v", nicName, err)
 	}
 
+	brAddrs, err := netlink.AddrList(bridge, netlink.FAMILY_ALL)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get addresses on OVS bridge %s: %v", brName, err)
+	}
+
+	var delAddrs []netlink.Addr
+	if delNonExistent {
+		for _, addr := range brAddrs {
+			if addr.IP.IsLinkLocalUnicast() {
+				// skip 169.254.0.0/16 and fe80::/10
+				continue
+			}
+
+			var found bool
+			for _, v := range addrs {
+				if v.Equal(addr) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				delAddrs = append(delAddrs, addr)
+			}
+		}
+	}
+
 	// set link unmanaged by NetworkManager
-	if err = nmSetManaged(nicName, false); err != nil {
-		klog.Errorf("failed set device %s unmanaged by NetworkManager: %v", nicName, err)
+	if err = c.nmSyncer.SetManaged(nicName, false); err != nil {
+		klog.Errorf("failed to set device %s unmanaged by NetworkManager: %v", nicName, err)
+		return 0, err
+	}
+	if err = c.nmSyncer.AddDevice(nicName, brName); err != nil {
+		klog.Errorf("failed to monitor NetworkManager event for device %s: %v", nicName, err)
 		return 0, err
 	}
 
@@ -928,6 +955,14 @@ func configProviderNic(nicName, brName string) (int, error) {
 			return 0, fmt.Errorf("failed to replace address %q on OVS bridge %s: %v", addr.String(), brName, err)
 		}
 		klog.Infof("address %q has been added/replaced to link %s", addr.String(), brName)
+	}
+	for _, addr := range delAddrs {
+		if err = netlink.AddrDel(bridge, &addr); err != nil {
+			errMsg := fmt.Errorf("failed to delete address %q on OVS bridge %s: %v", addr.String(), brName, err)
+			klog.Error(errMsg)
+			return 0, errMsg
+		}
+		klog.Infof("address %q has been removed from OVS bridge %s", addr.String(), brName)
 	}
 
 	// keep mac address the same with the provider nic,
@@ -955,11 +990,76 @@ func configProviderNic(nicName, brName string) (int, error) {
 			if route.Scope == scope {
 				route.LinkIndex = bridge.Attrs().Index
 				if err = netlink.RouteReplace(&route); err != nil {
-					return 0, fmt.Errorf("failed to add/replace route %s: %v", route.String(), err)
+					return 0, fmt.Errorf("failed to add/replace route %s to OVS bridge %s: %v", route.String(), brName, err)
 				}
-				klog.Infof("route %q has been added/replaced to link %s", route.String(), brName)
+				klog.Infof("route %q has been added/replaced to OVS bridge %s", route.String(), brName)
 			}
 		}
+	}
+
+	brRoutes, err := netlink.RouteList(bridge, netlink.FAMILY_ALL)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get routes on OVS bridge %s: %v", brName, err)
+	}
+
+	var delRoutes []netlink.Route
+	if delNonExistent {
+		for _, route := range brRoutes {
+			if route.Gw == nil && route.Dst != nil && route.Dst.IP.IsLinkLocalUnicast() {
+				// skip 169.254.0.0/16 and fe80::/10
+				continue
+			}
+
+			var found bool
+			for _, v := range routes {
+				v.LinkIndex = route.LinkIndex
+				v.ILinkIndex = route.ILinkIndex
+				if v.Equal(route) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				delRoutes = append(delRoutes, route)
+			}
+		}
+	}
+
+	for i := len(routeScopeOrders) - 1; i >= 0; i-- {
+		for _, route := range delRoutes {
+			if route.Scope == routeScopeOrders[i] {
+				if err = netlink.RouteDel(&route); err != nil {
+					return 0, fmt.Errorf("failed to delete route %s from OVS bridge %s: %v", route.String(), brName, err)
+				}
+				klog.Infof("route %q has been deleted from OVS bridge %s", route.String(), brName)
+			}
+		}
+	}
+
+	if err = netlink.LinkSetUp(nic); err != nil {
+		return 0, fmt.Errorf("failed to set link %s up: %v", nicName, err)
+	}
+
+	return nic.Attrs().MTU, nil
+}
+
+// Add host nic to external bridge
+// Mac address, MTU, IP addresses & routes will be copied/transferred to the external bridge
+func (c *Controller) configProviderNic(nicName, brName string) (int, error) {
+	sysctlDisableIPv6 := fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6", brName)
+	disableIPv6, err := sysctl.Sysctl(sysctlDisableIPv6)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get sysctl %s: %v", sysctlDisableIPv6, err)
+	}
+	if disableIPv6 != "0" {
+		if _, err = sysctl.Sysctl(sysctlDisableIPv6, "0"); err != nil {
+			return 0, fmt.Errorf("failed to enable ipv6 on OVS bridge %s: %v", brName, err)
+		}
+	}
+
+	mtu, err := c.transferAddrsAndRoutes(nicName, brName, false)
+	if err != nil {
+		return 0, fmt.Errorf("failed to transfer addresess and routes from %s to %s: %v", nicName, brName, err)
 	}
 
 	if _, err = ovs.Exec(ovs.MayExist, "add-port", brName, nicName,
@@ -968,11 +1068,7 @@ func configProviderNic(nicName, brName string) (int, error) {
 	}
 	klog.V(3).Infof("ovs port %s has been added to bridge %s", nicName, brName)
 
-	if err = netlink.LinkSetUp(nic); err != nil {
-		return 0, fmt.Errorf("failed to set link %s up: %v", nicName, err)
-	}
-
-	return nic.Attrs().MTU, nil
+	return mtu, nil
 }
 
 func linkIsAlbBond(link netlink.Link) (bool, error) {
@@ -1221,6 +1317,7 @@ func (csh cniServerHandler) configureNicWithInternalPort(podName, podNamespace, 
 	output, err := ovs.Exec(ovs.MayExist, "add-port", "br-int", containerNicName, "--",
 		"set", "interface", containerNicName, "type=internal", "--",
 		"set", "interface", containerNicName, fmt.Sprintf("external_ids:iface-id=%s", ifaceID),
+		fmt.Sprintf("external_ids:vendor=%s", util.CniTypeName),
 		fmt.Sprintf("external_ids:pod_name=%s", podName),
 		fmt.Sprintf("external_ids:pod_namespace=%s", podNamespace),
 		fmt.Sprintf("external_ids:ip=%s", ipStr),

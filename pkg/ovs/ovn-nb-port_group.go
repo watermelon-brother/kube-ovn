@@ -7,6 +7,7 @@ import (
 	"github.com/ovn-org/libovsdb/client"
 	"github.com/ovn-org/libovsdb/model"
 	"github.com/ovn-org/libovsdb/ovsdb"
+	"github.com/scylladb/go-set/strset"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
@@ -50,23 +51,38 @@ func (c *ovnClient) PortGroupRemovePorts(pgName string, lspNames ...string) erro
 	return c.PortGroupUpdatePorts(pgName, ovsdb.MutateOperationDelete, lspNames...)
 }
 
-// PortGroupResetPorts remove all ports from port group
-func (c *ovnClient) PortGroupResetPorts(pgName string) error {
-	pg, err := c.GetPortGroup(pgName, true)
+func (c *ovnClient) PortGroupSetPorts(pgName string, ports []string) error {
+	pg, err := c.GetPortGroup(pgName, false)
 	if err != nil {
 		return fmt.Errorf("get port group %s: %v", pgName, err)
 	}
 
-	// not found, skip
-	if pg == nil {
-		return nil
+	expected := strset.NewWithSize(len(ports))
+	for _, port := range ports {
+		lsp, err := c.GetLogicalSwitchPort(port, true)
+		if err != nil {
+			return err
+		}
+		if lsp != nil {
+			expected.Add(lsp.UUID)
+		}
 	}
 
-	// clear ports
-	pg.Ports = nil
+	existing := strset.New(pg.Ports...)
+	toAdd := strset.Difference(expected, existing).List()
+	toDel := strset.Difference(existing, expected).List()
 
-	if err := c.UpdatePortGroup(pg, &pg.Ports); err != nil {
-		return fmt.Errorf("reset port group %s ports: %v", pgName, err)
+	insertOps, err := c.portGroupUpdatePortOp(pgName, toAdd, ovsdb.MutateOperationInsert)
+	if err != nil {
+		return fmt.Errorf("failed generate operations for adding ports %v to port group %s: %v", toAdd, pgName, err)
+	}
+	deleteOps, err := c.portGroupUpdatePortOp(pgName, toDel, ovsdb.MutateOperationDelete)
+	if err != nil {
+		return fmt.Errorf("failed generate operations for deleting ports %v from port group %s: %v", toDel, pgName, err)
+	}
+
+	if err = c.Transact("pg-ports-update", append(insertOps, deleteOps...)); err != nil {
+		return fmt.Errorf("port group %s set ports %v: %v", pgName, ports, err)
 	}
 
 	return nil
@@ -221,7 +237,7 @@ func (c *ovnClient) portGroupUpdatePortOp(pgName string, lspUUIDs []string, op o
 	return c.portGroupOp(pgName, mutation)
 }
 
-// portGroupUpdatePortOp create operations add acl to or delete acl from port group
+// portGroupUpdateAclOp create operations add acl to or delete acl from port group
 func (c *ovnClient) portGroupUpdateAclOp(pgName string, aclUUIDs []string, op ovsdb.Mutator) ([]ovsdb.Operation, error) {
 	if len(aclUUIDs) == 0 {
 		return nil, nil

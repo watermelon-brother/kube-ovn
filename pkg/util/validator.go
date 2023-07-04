@@ -105,7 +105,85 @@ func ValidateSubnet(subnet kubeovnv1.Subnet) error {
 			}
 		}
 	}
+
+	if subnet.Spec.LogicalGateway && subnet.Spec.U2OInterconnection {
+		return fmt.Errorf("logicalGateway and u2oInterconnection can't be opened at the same time")
+	}
+
+	if len(subnet.Spec.NatOutgoingPolicyRules) != 0 {
+		if err := validateNatOutgoingPolicyRules(subnet); err != nil {
+			return err
+		}
+	}
+
+	if subnet.Spec.U2OInterconnectionIP != "" {
+		if !CIDRContainIP(subnet.Spec.CIDRBlock, subnet.Spec.U2OInterconnectionIP) {
+			return fmt.Errorf("u2oInterconnectionIP %s is not in subnet %s cidr %s",
+				subnet.Spec.U2OInterconnectionIP,
+				subnet.Name, subnet.Spec.CIDRBlock)
+		}
+	}
+
 	return nil
+}
+
+func validateNatOutgoingPolicyRules(subnet kubeovnv1.Subnet) error {
+	for _, rule := range subnet.Spec.NatOutgoingPolicyRules {
+		var srcProtocol, dstProtocol string
+		var err error
+
+		if rule.Match.SrcIPs != "" {
+			if srcProtocol, err = validateNatOutGoingPolicyRuleIPs(rule.Match.SrcIPs); err != nil {
+				return fmt.Errorf("validate nat policy rules src ips %s failed with err %v ", rule.Match.SrcIPs, err)
+			}
+		}
+		if rule.Match.DstIPs != "" {
+			if dstProtocol, err = validateNatOutGoingPolicyRuleIPs(rule.Match.DstIPs); err != nil {
+				return fmt.Errorf("validate nat policy rules dst ips %s failed with err %v ", rule.Match.DstIPs, err)
+			}
+		}
+
+		if srcProtocol != "" && dstProtocol != "" && srcProtocol != dstProtocol {
+			return fmt.Errorf("Match.SrcIPS protocol %s not equal to Match.DstIPs protocol %s ", srcProtocol, dstProtocol)
+		}
+	}
+	return nil
+}
+
+func validateNatOutGoingPolicyRuleIPs(matchIPStr string) (string, error) {
+	ipItems := strings.Split(matchIPStr, ",")
+	if len(ipItems) == 0 {
+		return "", fmt.Errorf("MatchIPStr format error")
+	}
+	lastProtocol := ""
+	checkProtocolConsistent := func(ipCidr string) bool {
+		currentProtocol := CheckProtocol(ipCidr)
+		if lastProtocol != "" && lastProtocol != currentProtocol {
+			return false
+		}
+		lastProtocol = currentProtocol
+		return true
+	}
+
+	for _, ipItem := range ipItems {
+		_, ipCidr, err := net.ParseCIDR(ipItem)
+		if err == nil {
+			if !checkProtocolConsistent(ipCidr.String()) {
+				return "", fmt.Errorf("match ips %s protocol is not consistent", matchIPStr)
+			}
+			continue
+		}
+
+		if IsValidIP(ipItem) {
+			if !checkProtocolConsistent(ipItem) {
+				return "", fmt.Errorf("match ips %s protocol is not consistent", matchIPStr)
+			}
+			continue
+		}
+
+		return "", fmt.Errorf("match ips %s is not ip or ipcidr ", matchIPStr)
+	}
+	return lastProtocol, nil
 }
 
 func ValidatePodNetwork(annotations map[string]string) error {
@@ -149,17 +227,19 @@ func ValidatePodNetwork(annotations map[string]string) error {
 
 	ipPool := annotations[IpPoolAnnotation]
 	if ipPool != "" {
-		for _, ips := range strings.Split(ipPool, ";") {
-			if cidrStr := annotations[CidrAnnotation]; cidrStr != "" {
-				if !CIDRContainIP(cidrStr, ips) {
-					errors = append(errors, fmt.Errorf("%s not in cidr %s", ips, cidrStr))
-					continue
+		if strings.ContainsRune(ipPool, ';') || strings.ContainsRune(ipPool, ',') || net.ParseIP(ipPool) != nil {
+			for _, ips := range strings.Split(ipPool, ";") {
+				if cidrStr := annotations[CidrAnnotation]; cidrStr != "" {
+					if !CIDRContainIP(cidrStr, ips) {
+						errors = append(errors, fmt.Errorf("%s not in cidr %s", ips, cidrStr))
+						continue
+					}
 				}
-			}
 
-			for _, ip := range strings.Split(ips, ",") {
-				if net.ParseIP(strings.TrimSpace(ip)) == nil {
-					errors = append(errors, fmt.Errorf("%s in %s is not a valid address", ip, IpPoolAnnotation))
+				for _, ip := range strings.Split(ips, ",") {
+					if net.ParseIP(strings.TrimSpace(ip)) == nil {
+						errors = append(errors, fmt.Errorf("%s in %s is not a valid address", ip, IpPoolAnnotation))
+					}
 				}
 			}
 		}
@@ -248,8 +328,11 @@ func ValidateVpc(vpc *kubeovnv1.Vpc) error {
 		}
 
 		if item.Action == kubeovnv1.PolicyRouteActionReroute {
-			if ip := net.ParseIP(item.NextHopIP); ip == nil {
-				return fmt.Errorf("bad next hop ip: %s", item.NextHopIP)
+			// ecmp policy route may reroute to multiple next hop ips
+			for _, ipStr := range strings.Split(item.NextHopIP, ",") {
+				if ip := net.ParseIP(ipStr); ip == nil {
+					return fmt.Errorf("invalid next hop ips: %s", item.NextHopIP)
+				}
 			}
 		}
 	}

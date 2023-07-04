@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"math/big"
 	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	dockertypes "github.com/docker/docker/api/types"
 	corev1 "k8s.io/api/core/v1"
@@ -82,7 +84,7 @@ var _ = framework.SerialDescribe("[group:lb-svc]", func() {
 
 		if clusterName == "" {
 			ginkgo.By("Getting k8s nodes")
-			k8sNodes, err := e2enode.GetReadySchedulableNodes(cs)
+			k8sNodes, err := e2enode.GetReadySchedulableNodes(context.Background(), cs)
 			framework.ExpectNoError(err)
 
 			cluster, ok := kind.IsKindProvided(k8sNodes.Items[0].Spec.ProviderID)
@@ -111,10 +113,11 @@ var _ = framework.SerialDescribe("[group:lb-svc]", func() {
 		excludeIPs := make([]string, 0, len(dockerNetwork.Containers))
 		for _, container := range dockerNetwork.Containers {
 			if container.IPv4Address != "" {
-				excludeIPs = append(excludeIPs, container.IPv4Address)
+				ip, _, _ := net.ParseCIDR(container.IPv4Address)
+				excludeIPs = append(excludeIPs, ip.String())
 			}
 		}
-		subnet := framework.MakeSubnet(subnetName, "", cidr, gateway, excludeIPs, nil, []string{namespaceName})
+		subnet := framework.MakeSubnet(subnetName, "", cidr, gateway, "", "", excludeIPs, nil, []string{namespaceName})
 		subnet.Spec.Provider = subnetProvider
 		_ = subnetClient.Create(subnet)
 	})
@@ -147,11 +150,12 @@ var _ = framework.SerialDescribe("[group:lb-svc]", func() {
 		}, "cluster ips are not empty")
 
 		ginkgo.By("Waiting for deployment " + deploymentName + " to be ready")
-		framework.WaitUntil(func() (bool, error) {
-			_, err := deploymentClient.DeploymentInterface.Get(context.TODO(), deploymentName, metav1.GetOptions{})
+		framework.WaitUntil(2*time.Second, time.Minute, func(ctx context.Context) (bool, error) {
+			_, err := deploymentClient.DeploymentInterface.Get(ctx, deploymentName, metav1.GetOptions{})
 			if err == nil {
 				return true, nil
 			}
+			ginkgo.By("deployment " + deploymentName + " still not ready")
 			if k8serrors.IsNotFound(err) {
 				return false, nil
 			}
@@ -178,7 +182,7 @@ var _ = framework.SerialDescribe("[group:lb-svc]", func() {
 		framework.ExpectTrue(util.CIDRContainIP(cidr, ip))
 
 		ginkgo.By("Checking service external IP")
-		framework.WaitUntil(func() (bool, error) {
+		framework.WaitUntil(2*time.Second, time.Minute, func(_ context.Context) (bool, error) {
 			service = serviceClient.Get(serviceName)
 			return len(service.Status.LoadBalancer.Ingress) != 0, nil
 		}, ".status.loadBalancer.ingress is not empty")
@@ -204,8 +208,8 @@ var _ = framework.SerialDescribe("[group:lb-svc]", func() {
 		_ = serviceClient.Create(service)
 
 		ginkgo.By("Waiting for deployment " + deploymentName + " to be ready")
-		framework.WaitUntil(func() (bool, error) {
-			_, err := deploymentClient.DeploymentInterface.Get(context.TODO(), deploymentName, metav1.GetOptions{})
+		framework.WaitUntil(2*time.Second, time.Minute, func(ctx context.Context) (bool, error) {
+			_, err := deploymentClient.DeploymentInterface.Get(ctx, deploymentName, metav1.GetOptions{})
 			if err == nil {
 				return true, nil
 			}
@@ -232,7 +236,7 @@ var _ = framework.SerialDescribe("[group:lb-svc]", func() {
 		framework.ExpectTrue(util.CIDRContainIP(cidr, lbIP))
 
 		ginkgo.By("Checking service external IP")
-		framework.WaitUntil(func() (bool, error) {
+		framework.WaitUntil(2*time.Second, time.Minute, func(_ context.Context) (bool, error) {
 			service = serviceClient.Get(serviceName)
 			return len(service.Status.LoadBalancer.Ingress) != 0, nil
 		}, ".status.loadBalancer.ingress is not empty")

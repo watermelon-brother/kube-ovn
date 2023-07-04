@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/scylladb/go-set/strset"
 	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
@@ -185,7 +186,7 @@ func addSerailAddrCapacity(b *testing.B, im *ipam.IPAM, protocol string) {
 	for n := 0; n < b.N; n++ {
 		podName := fmt.Sprintf("pod%d", n)
 		nicName := fmt.Sprintf("nic%d", n)
-		if _, _, _, err := im.GetRandomAddress(podName, nicName, "", subnetName, nil, true); err != nil {
+		if _, _, _, err := im.GetRandomAddress(podName, nicName, nil, subnetName, "", nil, true); err != nil {
 			b.Errorf("ERROR: allocate %s address failed with index %d with err %v ", protocol, n, err)
 			return
 		}
@@ -216,7 +217,7 @@ func addRandomAddrCapacity(b *testing.B, im *ipam.IPAM, protocol string, isTimeT
 			startTime = currentTime
 		}
 
-		if _, _, _, err := im.GetStaticAddress(podName, nicName, ip, "", subnetName, true); err != nil {
+		if _, _, _, err := im.GetStaticAddress(podName, nicName, ip, nil, subnetName, true); err != nil {
 			b.Errorf("ERROR: allocate %s address failed with index %d with err %v ", protocol, n, err)
 			return
 		}
@@ -312,7 +313,7 @@ func benchmarkAllocFreeAddrParallel(b *testing.B, podNumber int, protocol string
 				podName := fmt.Sprintf("pod%d_%d", key, n)
 				nicName := fmt.Sprintf("nic%d_%d", key, n)
 				if key%2 == 1 {
-					if _, _, _, err := im.GetRandomAddress(podName, nicName, "", subnetName, nil, true); err != nil {
+					if _, _, _, err := im.GetRandomAddress(podName, nicName, nil, subnetName, "", nil, true); err != nil {
 						b.Errorf("ERROR: allocate %s address failed with index %d err %v ", protocol, n, err)
 						return
 					}
@@ -323,7 +324,7 @@ func benchmarkAllocFreeAddrParallel(b *testing.B, podNumber int, protocol string
 						return
 					}
 
-					if _, _, _, err := im.GetStaticAddress(podName, nicName, ip, "", subnetName, false); err != nil {
+					if _, _, _, err := im.GetStaticAddress(podName, nicName, ip, nil, subnetName, false); err != nil {
 						b.Errorf("ERROR: allocate %s address failed with index %d with err %v ", protocol, n, err)
 						return
 					}
@@ -362,9 +363,9 @@ func getDefaultSubnetParam(protocol string) (string, string, string, []string) {
 	return "", "", "", nil
 }
 
-func getDefaultSubnetRandomIps(b *testing.B, protocol string, ipCount int) *StringSet {
+func getDefaultSubnetRandomIps(b *testing.B, protocol string, ipCount int) *stringSet {
 	var newIp string
-	ipSet := NewStringSet()
+	ipSet := newStringSet()
 	for n := 0; ipSet.Len() < ipCount; n++ {
 		bytes := make([]byte, 3)
 		if _, err := rand.Read(bytes); err != nil {
@@ -390,35 +391,27 @@ func getRandomInt() int {
 	return int(randInt.Int64())
 }
 
-type StringSet struct {
-	StringMap map[string]interface{}
-	mutex     sync.RWMutex
+type stringSet struct {
+	*strset.Set
+	mutex sync.RWMutex
 }
 
-func NewStringSet() *StringSet {
-	return &StringSet{
-		StringMap: map[string]interface{}{},
+func newStringSet() *stringSet {
+	return &stringSet{
+		Set: strset.New(),
 	}
 }
 
-func (s *StringSet) Add(item string) bool {
-	if _, ok := s.StringMap[item]; ok {
-		return false
-	}
-	s.StringMap[item] = struct{}{}
-	return true
+func (s *stringSet) Add(item string) {
+	s.Set.Add(item)
 }
 
-func (s *StringSet) Pop() (string, bool) {
+func (s *stringSet) Pop() (string, bool) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	for key := range s.StringMap {
-		delete(s.StringMap, key)
-		return key, true
-	}
-	return "", false
+	return s.Pop2()
 }
 
-func (s *StringSet) Len() int {
-	return len(s.StringMap)
+func (s *stringSet) Len() int {
+	return s.Size()
 }

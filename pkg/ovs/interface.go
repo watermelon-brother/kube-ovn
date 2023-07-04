@@ -7,9 +7,10 @@ import (
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
+	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-type NbGlobal interface {
+type NBGlobal interface {
 	UpdateNbGlobal(nbGlobal *ovnnb.NBGlobal, fields ...interface{}) error
 	SetAzName(azName string) error
 	SetUseCtInvMatch() error
@@ -22,6 +23,7 @@ type NbGlobal interface {
 type LogicalRouter interface {
 	CreateLogicalRouter(lrName string) error
 	DeleteLogicalRouter(lrName string) error
+	LogicalRouterUpdateLoadBalancers(lrName string, op ovsdb.Mutator, lbNames ...string) error
 	GetLogicalRouter(lrName string, ignoreNotFound bool) (*ovnnb.LogicalRouter, error)
 	ListLogicalRouter(needVendorFilter bool, filter func(lr *ovnnb.LogicalRouter) bool) ([]ovnnb.LogicalRouter, error)
 	LogicalRouterExists(name string) (bool, error)
@@ -31,11 +33,18 @@ type LogicalRouterPort interface {
 	CreatePeerRouterPort(localRouter, remoteRouter, localRouterPortIP string) error
 	CreateLogicalRouterPort(lrName string, lrpName, mac string, networks []string) error
 	UpdateLogicalRouterPortRA(lrpName, ipv6RAConfigsStr string, enableIPv6RA bool) error
+	UpdateLogicalRouterPortOptions(lrpName string, options map[string]string) error
 	DeleteLogicalRouterPort(lrpName string) error
 	DeleteLogicalRouterPorts(externalIDs map[string]string, filter func(lrp *ovnnb.LogicalRouterPort) bool) error
 	GetLogicalRouterPort(lrpName string, ignoreNotFound bool) (*ovnnb.LogicalRouterPort, error)
+	GetLogicalRouterPortByUUID(uuid string) (*ovnnb.LogicalRouterPort, error)
 	ListLogicalRouterPorts(externalIDs map[string]string, filter func(lrp *ovnnb.LogicalRouterPort) bool) ([]ovnnb.LogicalRouterPort, error)
 	LogicalRouterPortExists(lrpName string) (bool, error)
+}
+
+type BFD interface {
+	CreateBFD(lrpName, dstIP string, minRx, minTx, detectMult int) (*ovnnb.BFD, error)
+	DeleteBFD(lrpName, dstIP string) error
 }
 
 type LogicalSwitch interface {
@@ -43,7 +52,7 @@ type LogicalSwitch interface {
 	CreateBareLogicalSwitch(lsName string) error
 	LogicalSwitchUpdateLoadBalancers(lsName string, op ovsdb.Mutator, lbNames ...string) error
 	DeleteLogicalSwitch(lsName string) error
-	ListLogicalSwitch(needVendorFilter bool, filter func(lr *ovnnb.LogicalSwitch) bool) ([]ovnnb.LogicalSwitch, error)
+	ListLogicalSwitch(needVendorFilter bool, filter func(ls *ovnnb.LogicalSwitch) bool) ([]ovnnb.LogicalSwitch, error)
 	LogicalSwitchExists(lsName string) (bool, error)
 }
 
@@ -54,10 +63,10 @@ type LogicalSwitchPort interface {
 	CreateVirtualLogicalSwitchPorts(lsName string, ips ...string) error
 	SetLogicalSwitchPortSecurity(portSecurity bool, lspName, mac, ips, vips string) error
 	SetLogicalSwitchPortVirtualParents(lsName, parents string, ips ...string) error
+	SetLogicalSwitchPortArpProxy(lspName string, enableArpProxy bool) error
 	SetLogicalSwitchPortExternalIds(lspName string, externalIds map[string]string) error
 	SetLogicalSwitchPortVlanTag(lspName string, vlanID int) error
 	SetLogicalSwitchPortsSecurityGroup(sgName string, op string) error
-	UpdateLogicalSwitchAcl(lsName string, subnetAcls []kubeovnv1.Acl) error
 	EnablePortLayer2forward(lspName string) error
 	DeleteLogicalSwitchPort(lspName string) error
 	ListLogicalSwitchPorts(needVendorFilter bool, externalIDs map[string]string, filter func(lsp *ovnnb.LogicalSwitchPort) bool) ([]ovnnb.LogicalSwitchPort, error)
@@ -69,8 +78,8 @@ type LogicalSwitchPort interface {
 
 type LoadBalancer interface {
 	CreateLoadBalancer(lbName, protocol, selectFields string) error
-	LoadBalancerAddVips(lbName string, vips map[string]string) error
-	LoadBalancerDeleteVips(lbName string, vips ...string) error
+	LoadBalancerAddVip(lbName, vip string, backends ...string) error
+	LoadBalancerDeleteVip(lbName, vip string) error
 	SetLoadBalancerAffinityTimeout(lbName string, timeout int) error
 	DeleteLoadBalancers(filter func(lb *ovnnb.LoadBalancer) bool) error
 	GetLoadBalancer(lbName string, ignoreNotFound bool) (*ovnnb.LoadBalancer, error)
@@ -82,7 +91,7 @@ type PortGroup interface {
 	CreatePortGroup(pgName string, externalIDs map[string]string) error
 	PortGroupAddPorts(pgName string, lspNames ...string) error
 	PortGroupRemovePorts(pgName string, lspNames ...string) error
-	PortGroupResetPorts(pgName string) error
+	PortGroupSetPorts(pgName string, ports []string) error
 	DeletePortGroup(pgName string) error
 	ListPortGroups(externalIDs map[string]string) ([]ovnnb.PortGroup, error)
 	GetPortGroup(pgName string, ignoreNotFound bool) (*ovnnb.PortGroup, error)
@@ -90,15 +99,18 @@ type PortGroup interface {
 }
 
 type ACL interface {
-	CreateIngressAcl(pgName, asIngressName, asExceptName, protocol string, npp []netv1.NetworkPolicyPort) error
-	CreateEgressAcl(pgName, asEgressName, asExceptName, protocol string, npp []netv1.NetworkPolicyPort) error
-	CreateGatewayAcl(pgName, gateway string) error
-	CreateNodeAcl(pgName, nodeIp string) error
+	UpdateIngressAclOps(pgName, asIngressName, asExceptName, protocol string, npp []netv1.NetworkPolicyPort, logEnable bool, namedPortMap map[string]*util.NamedPortInfo) ([]ovsdb.Operation, error)
+	UpdateEgressAclOps(pgName, asEgressName, asExceptName, protocol string, npp []netv1.NetworkPolicyPort, logEnable bool, namedPortMap map[string]*util.NamedPortInfo) ([]ovsdb.Operation, error)
+	CreateGatewayAcl(lsName, pgName, gateway string) error
+	CreateNodeAcl(pgName, nodeIpStr, joinIpStr string) error
 	CreateSgDenyAllAcl(sgName string) error
+	CreateSgBaseACL(sgName string, direction string) error
 	UpdateSgAcl(sg *kubeovnv1.SecurityGroup, direction string) error
-	SetAclLog(pgName string, logEnable, isIngress bool) error
+	UpdateLogicalSwitchAcl(lsName string, subnetAcls []kubeovnv1.Acl) error
+	SetAclLog(pgName, protocol string, logEnable, isIngress bool) error
 	SetLogicalSwitchPrivate(lsName, cidrBlock string, allowSubnets []string) error
-	DeleteAcls(parentName, parentType string, direction string) error
+	DeleteAcls(parentName, parentType string, direction string, externalIDs map[string]string) error
+	DeleteAclsOps(parentName, parentType string, direction string, externalIDs map[string]string) ([]ovsdb.Operation, error)
 }
 
 type AddressSet interface {
@@ -110,12 +122,12 @@ type AddressSet interface {
 }
 
 type LogicalRouterStaticRoute interface {
-	AddLogicalRouterStaticRoute(lrName, policy, cidrBlock, nextHops, routeType string) error
+	AddLogicalRouterStaticRoute(lrName, routeTable, policy, ipPrefix string, nexthops ...string) error
 	ClearLogicalRouterStaticRoute(lrName string) error
-	DeleteLogicalRouterStaticRoute(lrName, policy, prefix, nextHop, routeType string) error
-	GetLogicalRouterRouteByOpts(key, value string) ([]ovnnb.LogicalRouterStaticRoute, error)
-	ListLogicalRouterStaticRoutes(externalIDs map[string]string) ([]ovnnb.LogicalRouterStaticRoute, error)
-	LogicalRouterStaticRouteExists(lrName, policy, prefix, nextHop, routeType string) (bool, error)
+	DeleteLogicalRouterStaticRoute(lrName string, routeTable, policy *string, ipPrefix, nextHop string) error
+	ListLogicalRouterStaticRoutesByOption(lrName, routeTable, key, value string) ([]*ovnnb.LogicalRouterStaticRoute, error)
+	ListLogicalRouterStaticRoutes(lrName string, routeTable, policy *string, ipPrefix string, externalIDs map[string]string) ([]*ovnnb.LogicalRouterStaticRoute, error)
+	LogicalRouterStaticRouteExists(lrName, routeTable, policy, ipPrefix, nexthop string) (bool, error)
 }
 
 type LogicalRouterPolicy interface {
@@ -123,9 +135,10 @@ type LogicalRouterPolicy interface {
 	DeleteLogicalRouterPolicy(lrName string, priority int, match string) error
 	DeleteLogicalRouterPolicies(lrName string, priority int, externalIDs map[string]string) error
 	DeleteLogicalRouterPolicyByUUID(lrName string, uuid string) error
+	DeleteLogicalRouterPolicyByNexthop(lrName string, priority int, nexthop string) error
 	ClearLogicalRouterPolicy(lrName string) error
-	ListLogicalRouterPolicies(priority int, externalIDs map[string]string) ([]ovnnb.LogicalRouterPolicy, error)
-	GetLogicalRouterPolicy(lrName string, priority int, match string, ignoreNotFound bool) (*ovnnb.LogicalRouterPolicy, error)
+	ListLogicalRouterPolicies(lrName string, priority int, externalIDs map[string]string) ([]*ovnnb.LogicalRouterPolicy, error)
+	GetLogicalRouterPolicy(lrName string, priority int, match string, ignoreNotFound bool) ([]*ovnnb.LogicalRouterPolicy, error)
 }
 
 type NAT interface {
@@ -134,7 +147,7 @@ type NAT interface {
 	DeleteNats(lrName, natType, logicalIP string) error
 	DeleteNat(lrName, natType, externalIP, logicalIP string) error
 	NatExists(lrName, natType, externalIP, logicalIP string) (bool, error)
-	ListNats(natType, logicalIP string, externalIDs map[string]string) ([]ovnnb.NAT, error)
+	ListNats(lrName, natType, logicalIP string, externalIDs map[string]string) ([]*ovnnb.NAT, error)
 }
 
 type DHCPOptions interface {
@@ -145,23 +158,26 @@ type DHCPOptions interface {
 }
 
 type OvnClient interface {
-	NbGlobal
-	LogicalRouter
-	LogicalRouterPort
-	LogicalSwitch
-	LogicalSwitchPort
-	LoadBalancer
-	PortGroup
 	ACL
 	AddressSet
-	LogicalRouterStaticRoute
-	LogicalRouterPolicy
-	NAT
+	BFD
 	DHCPOptions
+	// GatewayChassis
+	LoadBalancer
+	LogicalRouterPolicy
+	LogicalRouterPort
+	LogicalRouterStaticRoute
+	LogicalRouter
+	LogicalSwitchPort
+	LogicalSwitch
+	NAT
+	NBGlobal
+	PortGroup
 	CreateGatewayLogicalSwitch(lsName, lrName, provider, ip, mac string, vlanID int, chassises ...string) error
 	CreateLogicalPatchPort(lsName, lrName, lspName, lrpName, ip, mac string, chassises ...string) error
 	RemoveLogicalPatchPort(lspName, lrpName string) error
 	DeleteLogicalGatewaySwitch(lsName, lrName string) error
 	DeleteSecurityGroup(sgName string) error
 	GetEntityInfo(entity interface{}) error
+	Transact(method string, operations []ovsdb.Operation) error
 }

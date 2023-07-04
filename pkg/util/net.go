@@ -9,11 +9,14 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 )
+
+var vpcExternalNet = "ovn-vpc-external-network"
 
 const (
 	IPv4Multicast        = "224.0.0.0/4"
@@ -178,13 +181,24 @@ func AddressCount(network *net.IPNet) float64 {
 }
 
 func GenerateRandomV4IP(cidr string) string {
+	return genRandomIP(cidr, false)
+}
+
+func GenerateRandomV6IP(cidr string) string {
+	return genRandomIP(cidr, true)
+}
+
+func genRandomIP(cidr string, isIPv6 bool) string {
 	if len(strings.Split(cidr, "/")) != 2 {
 		return ""
 	}
 	ip := strings.Split(cidr, "/")[0]
 	netMask, _ := strconv.Atoi(strings.Split(cidr, "/")[1])
-	hostNum := 32 - netMask
-	add, err := rand.Int(rand.Reader, big.NewInt(1<<(uint(hostNum)-1)))
+	hostBits := 32 - netMask
+	if isIPv6 {
+		hostBits = 128 - netMask
+	}
+	add, err := rand.Int(rand.Reader, big.NewInt(1<<(uint(hostBits)-1)))
 	if err != nil {
 		LogFatalAndExit(err, "failed to generate random ip")
 	}
@@ -260,7 +274,7 @@ func SplitIpsByProtocol(excludeIps []string) ([]string, []string) {
 	var v4ExcludeIps, v6ExcludeIps []string
 	for _, ex := range excludeIps {
 		ips := strings.Split(ex, "..")
-		if net.ParseIP(ips[0]).To4() != nil {
+		if CheckProtocol(ips[0]) == kubeovnv1.ProtocolIPv4 {
 			v4ExcludeIps = append(v4ExcludeIps, ex)
 		} else {
 			v6ExcludeIps = append(v6ExcludeIps, ex)
@@ -506,4 +520,104 @@ func CheckSystemCIDR(cidrs []string) error {
 		}
 	}
 	return nil
+}
+
+// GetExternalNetwork returns the external network name
+// if the external network is not specified, return the default external network name
+func GetExternalNetwork(externalNet string) string {
+	if externalNet == "" {
+		return vpcExternalNet
+	}
+	return externalNet
+}
+
+func GetNatGwExternalNetwork(externalNets []string) string {
+	if len(externalNets) == 0 {
+		return vpcExternalNet
+	}
+	return externalNets[0]
+}
+
+func TCPConnectivityCheck(address string) error {
+	conn, err := net.DialTimeout("tcp", address, 3*time.Second)
+	if err != nil {
+		return err
+	}
+
+	_ = conn.Close()
+
+	return nil
+}
+
+func TCPConnectivityListen(address string) error {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("listen failed with err %v", err)
+	}
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		_ = conn.Close()
+	}
+}
+
+func UDPConnectivityCheck(address string) error {
+
+	udpAddr, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		return fmt.Errorf("resolve udp addr failed with err %v", err)
+	}
+
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return err
+	}
+
+	defer conn.Close()
+
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		return err
+	}
+
+	_, err = conn.Write([]byte("health check"))
+	if err != nil {
+		return fmt.Errorf("send udp packet failed with err %v", err)
+	}
+
+	buffer := make([]byte, 1024)
+	_, err = conn.Read(buffer)
+	if err != nil {
+		return fmt.Errorf("read udp packet from remote failed %v", err)
+	}
+
+	return nil
+}
+
+func UDPConnectivityListen(address string) error {
+	listenAddr, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		return fmt.Errorf("resolve udp addr failed with err %v", err)
+	}
+
+	conn, err := net.ListenUDP("udp", listenAddr)
+	if err != nil {
+		return fmt.Errorf("listen udp address failed with %v", err)
+	}
+
+	buffer := make([]byte, 1024)
+
+	for {
+		_, clientAddr, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			continue
+		}
+
+		_, err = conn.WriteToUDP([]byte("health check"), clientAddr)
+		if err != nil {
+			continue
+		}
+	}
 }

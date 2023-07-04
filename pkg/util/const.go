@@ -25,6 +25,7 @@ const (
 
 	OvnFipUseEipFinalizer  = "ovn.kubernetes.io/ovn_fip"
 	OvnSnatUseEipFinalizer = "ovn.kubernetes.io/ovn_snat"
+	OvnDnatUseEipFinalizer = "ovn.kubernetes.io/ovn_dnat"
 	OvnLrpUseEipFinalizer  = "ovn.kubernetes.io/ovn_lrp"
 
 	ExternalIpAnnotation         = "ovn.kubernetes.io/external_ip"
@@ -46,11 +47,13 @@ const (
 	VpcEipAnnotation            = "ovn.kubernetes.io/vpc_eip"
 	VpcDnatEPortLabel           = "ovn.kubernetes.io/vpc_dnat_eport"
 	VpcNatAnnotation            = "ovn.kubernetes.io/vpc_nat"
+	IptablesEipV4IPLabel        = "ovn.kubernetes.io/iptables_eip_v4_ip"
 
 	OvnEipUsageLabel        = "ovn.kubernetes.io/ovn_eip_usage"
 	OvnLrpEipEnableBfdLabel = "ovn.kubernetes.io/ovn_lrp_eip_enable_bfd"
 
 	SwitchLBRuleVipsAnnotation = "ovn.kubernetes.io/switch_lb_vip"
+	SwitchLBRuleVip            = "switch_lb_vip"
 
 	LogicalRouterAnnotation = "ovn.kubernetes.io/logical_router"
 	VpcAnnotation           = "ovn.kubernetes.io/vpc"
@@ -111,6 +114,8 @@ const (
 	VpcNatGatewayNameLabel     = "ovn.kubernetes.io/vpc-nat-gw-name"
 	VpcLbLabel                 = "ovn.kubernetes.io/vpc_lb"
 	VpcDnsNameLabel            = "ovn.kubernetes.io/vpc-dns"
+	QoSLabel                   = "ovn.kubernetes.io/qos"
+	NodeNameLabel              = "ovn.kubernetes.io/node-name"
 	NetworkPolicyLogAnnotation = "ovn.kubernetes.io/enable_log"
 
 	ProtocolTCP  = "tcp"
@@ -145,6 +150,8 @@ const (
 	SubnetAllowPriority = "1001"
 	DefaultDropPriority = "1000"
 
+	DefaultMTU = 1500
+
 	GeneveHeaderLength = 100
 	VxlanHeaderLength  = 50
 	SttHeaderLength    = 72
@@ -161,10 +168,10 @@ const (
 	InterconnectionSwitch  = "ts"
 	ExternalGatewaySwitch  = "ovn-external"
 	VpcNatGatewayConfig    = "ovn-vpc-nat-gw-config"
-	VpcExternalNet         = "ovn-vpc-external-network"
 	VpcLbNetworkAttachment = "ovn-vpc-lb"
 	VpcDnsConfig           = "vpc-dns-config"
 	VpcDnsDepTemplate      = "vpc-dns-dep"
+	VpcNatConfig           = "ovn-vpc-nat-config"
 
 	DefaultSecurityGroupName = "default-securitygroup"
 
@@ -176,7 +183,7 @@ const (
 
 	LrpUsingEip       = "lrp"
 	FipUsingEip       = "fip"
-	FipUsingVip       = "vip"
+	NatUsingVip       = "vip"
 	SnatUsingEip      = "snat"
 	DnatUsingEip      = "dnat"
 	NodeExtGwUsingEip = "node-ext-gw"
@@ -186,9 +193,10 @@ const (
 	IptablesFip = "iptables"
 
 	GatewayRouterPolicyPriority = 29000
-	NodeRouterPolicyPriority    = 30000
-	SubnetRouterPolicyPriority  = 31000
 	OvnICPolicyPriority         = 29500
+	NodeRouterPolicyPriority    = 30000
+	NodeLocalDnsPolicyPriority  = 30100
+	SubnetRouterPolicyPriority  = 31000
 
 	OffloadType  = "offload-port"
 	InternalType = "internal-port"
@@ -228,6 +236,8 @@ const (
 
 	MatchV4Src = "ip4.src"
 	MatchV4Dst = "ip4.dst"
+	MatchV6Src = "ip6.src"
+	MatchV6Dst = "ip6.dst"
 
 	U2OInterconnName = "u2o-interconnection.%s.%s"
 	U2OExcludeIPAg   = "%s.u2o_exclude_ip.%s"
@@ -235,4 +245,13 @@ const (
 	DefaultServiceSessionStickinessTimeout = 10800
 
 	OvnSubnetGatewayIptables = "ovn-subnet-gateway"
+
+	QoSDirectionIngress = "ingress"
+	QoSDirectionEgress  = "egress"
+
+	MainRouteTable = ""
+
+	NatPolicyRuleActionNat     = "nat"
+	NatPolicyRuleActionForward = "forward"
+	NatPolicyRuleIDLength      = 12
 )

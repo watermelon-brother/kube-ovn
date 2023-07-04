@@ -39,6 +39,15 @@ func (v *ValidatingHook) SubnetCreateHook(ctx context.Context, req admission.Req
 			err := fmt.Errorf("vpc and subnet cannot have the same name")
 			return ctrlwebhook.Errored(http.StatusBadRequest, err)
 		}
+
+		if o.Spec.Vpc == item.Name && item.Status.Standby && !item.Status.Default {
+			for _, ns := range o.Spec.Namespaces {
+				if !util.ContainsString(item.Spec.Namespaces, ns) {
+					err := fmt.Errorf("namespace '%s' is out of range to custom vpc '%s'", ns, item.Name)
+					return ctrlwebhook.Errored(http.StatusBadRequest, err)
+				}
+			}
+		}
 	}
 
 	return ctrlwebhook.Allowed("by pass")
@@ -54,7 +63,7 @@ func (v *ValidatingHook) SubnetUpdateHook(ctx context.Context, req admission.Req
 	if err := v.decoder.DecodeRaw(req.OldObject, &oldSubnet); err != nil {
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
-	if (o.Spec.Gateway != oldSubnet.Spec.Gateway) && (0 != o.Status.V4UsingIPs || 0 != o.Status.V6UsingIPs) {
+	if (o.Spec.Gateway != oldSubnet.Spec.Gateway) && (o.Status.V4UsingIPs != 0 || o.Status.V6UsingIPs != 0) {
 		err := fmt.Errorf("can't update gateway of cidr when any IPs in Using")
 		return ctrlwebhook.Denied(err.Error())
 	}
@@ -79,7 +88,7 @@ func (v *ValidatingHook) SubnetDeleteHook(ctx context.Context, req admission.Req
 	if err := v.decoder.DecodeRaw(req.OldObject, &subnet); err != nil {
 		return ctrlwebhook.Errored(http.StatusBadRequest, err)
 	}
-	if 0 != subnet.Status.V4UsingIPs || 0 != subnet.Status.V6UsingIPs {
+	if subnet.Status.V4UsingIPs != 0 || subnet.Status.V6UsingIPs != 0 {
 		err := fmt.Errorf("can't delete subnet when any IPs in Using")
 		return ctrlwebhook.Denied(err.Error())
 	}

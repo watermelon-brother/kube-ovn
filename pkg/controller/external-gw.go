@@ -142,7 +142,17 @@ func (c *Controller) establishExternalGateway(config map[string]string) error {
 		return err
 	}
 	var lrpIp, lrpMac string
-	if config["nic-ip"] == "" {
+	lrpName := fmt.Sprintf("%s-%s", c.config.ClusterRouter, c.config.ExternalGatewaySwitch)
+	lrp, err := c.ovnClient.GetLogicalRouterPort(lrpName, true)
+	if err != nil {
+		klog.Errorf("failed to get lrp %s, %v", lrpName, err)
+		return err
+	}
+	if lrp != nil {
+		klog.Infof("lrp %s already exist", lrpName)
+		lrpMac = lrp.MAC
+		lrpIp = lrp.Networks[0]
+	} else if config["nic-ip"] == "" {
 		if lrpIp, lrpMac, err = c.createDefaultVpcLrpEip(config); err != nil {
 			klog.Errorf("failed to create ovn eip for default vpc lrp: %v", err)
 			return err
@@ -151,16 +161,6 @@ func (c *Controller) establishExternalGateway(config map[string]string) error {
 		lrpIp = config["nic-ip"]
 		lrpMac = config["nic-mac"]
 	}
-	lrpName := fmt.Sprintf("%s-%s", c.config.ClusterRouter, c.config.ExternalGatewaySwitch)
-	exist, err := c.ovnClient.LogicalRouterPortExists(lrpName)
-	if err != nil {
-		return err
-	}
-	if exist {
-		klog.Infof("lrp %s exist", lrpName)
-		return nil
-	}
-
 	if err := c.ovnClient.CreateGatewayLogicalSwitch(c.config.ExternalGatewaySwitch, c.config.ClusterRouter, c.config.ExternalGatewayNet, lrpIp, lrpMac, c.config.ExternalGatewayVlanID, chassises...); err != nil {
 		klog.Errorf("create external gateway switch %s: %v", c.config.ExternalGatewaySwitch, err)
 		return err
@@ -176,7 +176,7 @@ func (c *Controller) createDefaultVpcLrpEip(config map[string]string) (string, s
 		return "", "", err
 	}
 	needCreateEip := false
-	lrpEipName := fmt.Sprintf("%s-%s", util.DefaultVpc, c.config.ExternalGatewaySwitch)
+	lrpEipName := fmt.Sprintf("%s-%s", c.config.ClusterRouter, c.config.ExternalGatewaySwitch)
 	cachedEip, err := c.ovnEipsLister.Get(lrpEipName)
 	if err != nil {
 		if !k8serrors.IsNotFound(err) {
@@ -294,7 +294,7 @@ func (c *Controller) updateDefaultVpcExternal(enableExternal bool) error {
 			klog.Errorf("failed to patch vpc %s, %v", c.config.ClusterRouter, err)
 			return err
 		}
-		lrpEipName := fmt.Sprintf("%s-%s", util.DefaultVpc, c.config.ExternalGatewaySwitch)
+		lrpEipName := fmt.Sprintf("%s-%s", c.config.ClusterRouter, c.config.ExternalGatewaySwitch)
 		if err := c.patchLrpOvnEipEnableBfdLabel(lrpEipName, vpc.Spec.EnableBfd); err != nil {
 			klog.Errorf("failed to patch label for lrp %s, %v", lrpEipName, err)
 			return err

@@ -27,8 +27,14 @@ const (
 func (c *ovnClient) CreateGatewayLogicalSwitch(lsName, lrName, provider, ip, mac string, vlanID int, chassises ...string) error {
 	lspName := fmt.Sprintf("%s-%s", lsName, lrName)
 	lrpName := fmt.Sprintf("%s-%s", lrName, lsName)
-	localnetLspName := fmt.Sprintf("ln-%s", lsName)
 
+	// delete old localnet lsp when upgrade before v1.12
+	oldLocalnetLspName := fmt.Sprintf("ln-%s", lsName)
+	if err := c.DeleteLogicalSwitchPort(oldLocalnetLspName); err != nil {
+		return fmt.Errorf("failed to delete old localnet %s: %v", oldLocalnetLspName, err)
+	}
+
+	localnetLspName := GetLocalnetName(lsName)
 	if err := c.CreateBareLogicalSwitch(lsName); err != nil {
 		return fmt.Errorf("create logical switch %s: %v", lsName, err)
 	}
@@ -101,7 +107,7 @@ func (c *ovnClient) DeleteSecurityGroup(sgName string) error {
 	pgName := GetSgPortGroupName(sgName)
 
 	// clear acl
-	if err := c.DeleteAcls(pgName, portGroupKey, ""); err != nil {
+	if err := c.DeleteAcls(pgName, portGroupKey, "", nil); err != nil {
 		return fmt.Errorf("delete acls from port group %s: %v", pgName, err)
 	}
 

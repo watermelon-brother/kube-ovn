@@ -8,7 +8,6 @@ import (
 	"github.com/ovn-org/libovsdb/client"
 	"github.com/ovn-org/libovsdb/model"
 	"github.com/ovn-org/libovsdb/ovsdb"
-
 	"k8s.io/klog/v2"
 
 	ovsclient "github.com/kubeovn/kube-ovn/pkg/ovsdb/client"
@@ -76,6 +75,30 @@ func (c *ovnClient) UpdateLogicalRouterPortRA(lrpName, ipv6RAConfigsStr string, 
 	}
 
 	return c.UpdateLogicalRouterPort(lrp, &lrp.Ipv6Prefix, &lrp.Ipv6RaConfigs)
+}
+
+func (c *ovnClient) UpdateLogicalRouterPortOptions(lrpName string, options map[string]string) error {
+	if len(options) == 0 {
+		return nil
+	}
+
+	lrp, err := c.GetLogicalRouterPort(lrpName, false)
+	if err != nil {
+		return err
+	}
+
+	for k, v := range options {
+		if len(v) == 0 {
+			delete(lrp.Options, k)
+		} else {
+			if len(lrp.Options) == 0 {
+				lrp.Options = make(map[string]string)
+			}
+			lrp.Options[k] = v
+		}
+	}
+
+	return c.UpdateLogicalRouterPort(lrp, &lrp.Options)
 }
 
 // UpdateLogicalRouterPort update logical router port
@@ -168,7 +191,7 @@ func (c *ovnClient) DeleteLogicalRouterPort(lrpName string) error {
 	return nil
 }
 
-// GetLogicalRouterPort get logical router port by name,
+// GetLogicalRouterPort get logical router port by name
 func (c *ovnClient) GetLogicalRouterPort(lrpName string, ignoreNotFound bool) (*ovnnb.LogicalRouterPort, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
 	defer cancel()
@@ -180,6 +203,19 @@ func (c *ovnClient) GetLogicalRouterPort(lrpName string, ignoreNotFound bool) (*
 		}
 
 		return nil, fmt.Errorf("get logical router port %s: %v", lrpName, err)
+	}
+
+	return lrp, nil
+}
+
+// GetLogicalRouterPortByUUID get logical router port by UUID
+func (c *ovnClient) GetLogicalRouterPortByUUID(uuid string) (*ovnnb.LogicalRouterPort, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
+	defer cancel()
+
+	lrp := &ovnnb.LogicalRouterPort{UUID: uuid}
+	if err := c.Get(ctx, lrp); err != nil {
+		return nil, fmt.Errorf("get logical router port by UUID %s: %v", uuid, err)
 	}
 
 	return lrp, nil
@@ -268,28 +304,9 @@ func (c *ovnClient) DeleteLogicalRouterPortOp(lrpName string) ([]ovsdb.Operation
 		return nil, nil
 	}
 
-	lrName, ok := lrp.ExternalIDs[logicalRouterKey]
-	if !ok {
-		return nil, fmt.Errorf("key %s does not exist in external_ids of lrp %s", logicalRouterKey, lrpName)
-	}
-
 	// remove logical router port from logical router
-	lrpRemoveOp, err := c.LogicalRouterUpdatePortOp(lrName, lrp.UUID, ovsdb.MutateOperationDelete)
-	if err != nil {
-		return nil, err
-	}
-
-	// delete logical router port
-	lrpDelOp, err := c.Where(lrp).Delete()
-	if err != nil {
-		return nil, err
-	}
-
-	ops := make([]ovsdb.Operation, 0, len(lrpRemoveOp)+len(lrpDelOp))
-	ops = append(ops, lrpRemoveOp...)
-	ops = append(ops, lrpDelOp...)
-
-	return ops, nil
+	lrName := lrp.ExternalIDs[logicalRouterKey]
+	return c.LogicalRouterUpdatePortOp(lrName, lrp.UUID, ovsdb.MutateOperationDelete)
 }
 
 // LogicalRouterPortOp create operations about logical router port
@@ -330,7 +347,7 @@ func logicalRouterPortFilter(externalIDs map[string]string, filter func(lrp *ovn
 
 		if len(lrp.ExternalIDs) != 0 {
 			for k, v := range externalIDs {
-				// if only key exist but not value in externalIDs, we should include this lsp,
+				// if only key exist but not value in externalIDs, we should include this lrp,
 				// it's equal to shell command `ovn-nbctl --columns=xx find logical_router_port external_ids:key!=\"\"`
 				if len(v) == 0 {
 					if len(lrp.ExternalIDs[k]) == 0 {

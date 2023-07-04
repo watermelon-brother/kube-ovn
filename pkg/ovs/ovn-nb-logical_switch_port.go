@@ -3,17 +3,19 @@ package ovs
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/ovn-org/libovsdb/client"
 	"github.com/ovn-org/libovsdb/ovsdb"
+	"github.com/scylladb/go-set/strset"
 
 	ovsclient "github.com/kubeovn/kube-ovn/pkg/ovsdb/client"
 	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
-func (c *ovnClient) CreateLogicalSwitchPort(lsName, lspName, ip, mac, podName, namespace string, portSecurity bool, securityGroups string, vips string, enableDHCP bool, dhcpOptions *DHCPOptionsUUIDs, vpc string) error {
+func (c *ovnClient) CreateLogicalSwitchPort(lsName, lspName, ip, mac, podName, namespace string, portSecurity bool, securityGroups, vips string, enableDHCP bool, dhcpOptions *DHCPOptionsUUIDs, vpc string) error {
 	exist, err := c.LogicalSwitchPortExists(lspName)
 	if err != nil {
 		return err
@@ -242,6 +244,29 @@ func (c *ovnClient) SetLogicalSwitchPortVirtualParents(lsName, parents string, i
 	return nil
 }
 
+func (c *ovnClient) SetLogicalSwitchPortArpProxy(lspName string, enableArpProxy bool) error {
+	lsp, err := c.GetLogicalSwitchPort(lspName, false)
+	if err != nil {
+		return fmt.Errorf("get logical switch port %s: %v", lspName, err)
+	}
+	if lsp.Options == nil {
+		lsp.Options = make(map[string]string)
+	}
+	lsp.Options["arp_proxy"] = strconv.FormatBool(enableArpProxy)
+	if !enableArpProxy {
+		delete(lsp.Options, "arp_proxy")
+	}
+
+	op, err := c.UpdateLogicalSwitchPortOp(lsp, &lsp.Options)
+	if err != nil {
+		return err
+	}
+	if err := c.Transact("lsp-update", op); err != nil {
+		return fmt.Errorf("failed to set logical switch port option arp_proxy %v", err)
+	}
+	return nil
+}
+
 // SetLogicalSwitchPortSecurity set logical switch port port_security
 func (c *ovnClient) SetLogicalSwitchPortSecurity(portSecurity bool, lspName, mac, ips, vips string) error {
 	lsp, err := c.GetLogicalSwitchPort(lspName, false)
@@ -324,33 +349,25 @@ func (c *ovnClient) SetLogicalSwitchPortSecurityGroup(lsp *ovnnb.LogicalSwitchPo
 	for _, sgName := range sgs {
 		associatedSgKey := associatedSgKeyPrefix + sgName
 		if op == "add" {
-			if _, ok := oldSgs[sgName]; ok {
+			if oldSgs.Has(sgName) {
 				continue // ignore existent
 			}
 
 			lsp.ExternalIDs[associatedSgKey] = "true"
-			oldSgs[sgName] = struct{}{}
+			oldSgs.Add(sgName)
 			diffSgs = append(diffSgs, sgName)
 		} else {
-			if _, ok := oldSgs[sgName]; !ok {
+			if !oldSgs.Has(sgName) {
 				continue // ignore non-existent
 			}
 
 			lsp.ExternalIDs[associatedSgKey] = "false"
-			delete(oldSgs, sgName)
+			oldSgs.Remove(sgName)
 			diffSgs = append(diffSgs, sgName)
 		}
 	}
 
-	newSgs := ""
-	for sg := range oldSgs {
-		if len(newSgs) != 0 {
-			newSgs += "/" + sg
-		} else {
-			newSgs = sg
-		}
-	}
-
+	newSgs := strings.Join(oldSgs.List(), "/")
 	lsp.ExternalIDs[sgsKey] = newSgs
 	if len(newSgs) == 0 { // when all sgs had been removed, delete sgsKey
 		delete(lsp.ExternalIDs, sgsKey)
@@ -472,7 +489,6 @@ func (c *ovnClient) DeleteLogicalSwitchPort(lspName string) error {
 func (c *ovnClient) GetLogicalSwitchPort(lspName string, ignoreNotFound bool) (*ovnnb.LogicalSwitchPort, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.Timeout)
 	defer cancel()
-
 	lsp := &ovnnb.LogicalSwitchPort{Name: lspName}
 	if err := c.Get(ctx, lsp); err != nil {
 		if ignoreNotFound && err == client.ErrNotFound {
@@ -577,21 +593,10 @@ func (c *ovnClient) DeleteLogicalSwitchPortOp(lspName string) ([]ovsdb.Operation
 
 	// remove logical switch port from logical switch
 	lsName := lsp.ExternalIDs[logicalSwitchKey]
-	lspRemoveOp, err := c.LogicalSwitchUpdatePortOp(lsName, lsp.UUID, ovsdb.MutateOperationDelete)
+	ops, err := c.LogicalSwitchUpdatePortOp(lsName, lsp.UUID, ovsdb.MutateOperationDelete)
 	if err != nil {
 		return nil, fmt.Errorf("generate operations for removing port %s from logical switch %s: %v", lspName, lsName, err)
 	}
-
-	// delete logical switch port
-	lspDelOp, err := c.Where(lsp).Delete()
-	if err != nil {
-		return nil, fmt.Errorf("generate operations for deleting logical switch port %s: %v", lspName, err)
-	}
-
-	ops := make([]ovsdb.Operation, 0, len(lspRemoveOp)+len(lspDelOp))
-	ops = append(ops, lspRemoveOp...)
-	ops = append(ops, lspDelOp...)
-
 	return ops, nil
 }
 
@@ -645,16 +650,13 @@ func logicalSwitchPortFilter(needVendorFilter bool, externalIDs map[string]strin
 }
 
 // getLogicalSwitchPortSgs get logical switch port security group
-func getLogicalSwitchPortSgs(lsp *ovnnb.LogicalSwitchPort) map[string]struct{} {
-	if lsp == nil {
-		return nil
-	}
-
-	sgs := make(map[string]struct{})
-	for key, value := range lsp.ExternalIDs {
-		if strings.HasPrefix(key, associatedSgKeyPrefix) && value == "true" {
-			sgName := strings.ReplaceAll(key, associatedSgKeyPrefix, "")
-			sgs[sgName] = struct{}{}
+func getLogicalSwitchPortSgs(lsp *ovnnb.LogicalSwitchPort) *strset.Set {
+	sgs := strset.New()
+	if lsp != nil {
+		for key, value := range lsp.ExternalIDs {
+			if strings.HasPrefix(key, associatedSgKeyPrefix) && value == "true" {
+				sgs.Add(strings.ReplaceAll(key, associatedSgKeyPrefix, ""))
+			}
 		}
 	}
 

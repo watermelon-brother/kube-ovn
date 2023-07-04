@@ -59,7 +59,7 @@ func CmdMain() {
 		util.LogFatalAndExit(err, "failed to initialize node gateway")
 	}
 
-	stopCh := signals.SetupSignalHandler()
+	stopCh := signals.SetupSignalHandler().Done()
 	podInformerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(config.KubeClient, 0,
 		kubeinformers.WithTweakListOptions(func(listOption *v1.ListOptions) {
 			listOption.FieldSelector = fmt.Sprintf("spec.nodeName=%s", config.NodeName)
@@ -73,13 +73,10 @@ func CmdMain() {
 		kubeovninformer.WithTweakListOptions(func(listOption *v1.ListOptions) {
 			listOption.AllowWatchBookmarks = true
 		}))
-	ctl, err := daemon.NewController(config, podInformerFactory, nodeInformerFactory, kubeovnInformerFactory)
+	ctl, err := daemon.NewController(config, stopCh, podInformerFactory, nodeInformerFactory, kubeovnInformerFactory)
 	if err != nil {
 		util.LogFatalAndExit(err, "failed to create controller")
 	}
-	podInformerFactory.Start(stopCh)
-	nodeInformerFactory.Start(stopCh)
-	kubeovnInformerFactory.Start(stopCh)
 	klog.Info("start daemon controller")
 	go ctl.Run(stopCh)
 	go daemon.RunServer(config, ctl)
@@ -112,6 +109,23 @@ func CmdMain() {
 			}
 		}
 	}
+
+	if config.EnableVerboseConnCheck {
+		go func() {
+			connListenaddr := fmt.Sprintf("%s:%d", addr, config.TCPConnCheckPort)
+			if err := util.TCPConnectivityListen(connListenaddr); err != nil {
+				util.LogFatalAndExit(err, "failed to start TCP listen on addr %s ", addr)
+			}
+		}()
+
+		go func() {
+			connListenaddr := fmt.Sprintf("%s:%d", addr, config.UDPConnCheckPort)
+			if err := util.UDPConnectivityListen(connListenaddr); err != nil {
+				util.LogFatalAndExit(err, "failed to start UDP listen on addr %s ", addr)
+			}
+		}()
+	}
+
 	// conform to Gosec G114
 	// https://github.com/securego/gosec#available-rules
 	server := &http.Server{

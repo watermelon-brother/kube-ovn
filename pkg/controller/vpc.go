@@ -17,7 +17,7 @@ import (
 	"k8s.io/klog/v2"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
-	"github.com/kubeovn/kube-ovn/pkg/ovs"
+	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
@@ -95,6 +95,10 @@ func (c *Controller) runDelVpcWorker() {
 }
 
 func (c *Controller) handleDelVpc(vpc *kubeovnv1.Vpc) error {
+	c.vpcKeyMutex.LockKey(vpc.Name)
+	defer func() { _ = c.vpcKeyMutex.UnlockKey(vpc.Name) }()
+	klog.Infof("handle delete vpc %s", vpc.Name)
+
 	if err := c.deleteVpcLb(vpc); err != nil {
 		return err
 	}
@@ -110,7 +114,7 @@ func (c *Controller) handleDelVpc(vpc *kubeovnv1.Vpc) error {
 	}
 	if vpc.Spec.EnableBfd || vpc.Status.EnableBfd {
 		lrpEipName := fmt.Sprintf("%s-%s", vpc.Name, c.config.ExternalGatewaySwitch)
-		if err := c.ovnLegacyClient.DeleteBfd(lrpEipName, ""); err != nil {
+		if err := c.ovnClient.DeleteBFD(lrpEipName, ""); err != nil {
 			klog.Error(err)
 			return err
 		}
@@ -119,6 +123,10 @@ func (c *Controller) handleDelVpc(vpc *kubeovnv1.Vpc) error {
 }
 
 func (c *Controller) handleUpdateVpcStatus(key string) error {
+	c.vpcKeyMutex.LockKey(key)
+	defer func() { _ = c.vpcKeyMutex.UnlockKey(key) }()
+	klog.Infof("handle status update for vpc %s", key)
+
 	cachedVpc, err := c.vpcsLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -177,7 +185,7 @@ type VpcLoadBalancer struct {
 }
 
 func (c *Controller) GenVpcLoadBalancer(vpcKey string) *VpcLoadBalancer {
-	if vpcKey == util.DefaultVpc || vpcKey == "" {
+	if vpcKey == c.config.ClusterRouter || vpcKey == "" {
 		return &VpcLoadBalancer{
 			TcpLoadBalancer:      c.config.ClusterTcpLoadBalancer,
 			TcpSessLoadBalancer:  c.config.ClusterTcpSessionLoadBalancer,
@@ -223,8 +231,12 @@ func (c *Controller) addLoadBalancer(vpc string) (*VpcLoadBalancer, error) {
 }
 
 func (c *Controller) handleAddOrUpdateVpc(key string) error {
+	c.vpcKeyMutex.LockKey(key)
+	defer func() { _ = c.vpcKeyMutex.UnlockKey(key) }()
+	klog.Infof("handle add/update vpc %s", key)
+
 	// get latest vpc info
-	cachedVpc, err := c.config.KubeOvnClient.KubeovnV1().Vpcs().Get(context.Background(), key, metav1.GetOptions{})
+	cachedVpc, err := c.vpcsLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
@@ -264,14 +276,19 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	}
 
 	// handle static route
-	existRoute, err := c.ovnLegacyClient.GetStaticRouteList(vpc.Name)
+	existRoute, err := c.ovnClient.ListLogicalRouterStaticRoutes(vpc.Name, nil, nil, "", nil)
 	if err != nil {
 		klog.Errorf("failed to get vpc %s static route list, %v", vpc.Name, err)
 		return err
 	}
 
+	rtbs := c.getRouteTablesByVpc(vpc)
 	targetRoutes := vpc.Spec.StaticRoutes
 	if vpc.Name == c.config.ClusterRouter {
+		if _, ok := rtbs[util.MainRouteTable]; !ok {
+			rtbs[util.MainRouteTable] = nil
+		}
+
 		joinSubnet, err := c.subnetsLister.Get(c.config.NodeSwitch)
 		if err != nil {
 			if !k8serrors.IsNotFound(err) {
@@ -281,18 +298,24 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 		}
 		gatewayV4, gatewayV6 := util.SplitStringIP(joinSubnet.Spec.Gateway)
 		if gatewayV4 != "" {
-			targetRoutes = append(targetRoutes, &kubeovnv1.StaticRoute{
-				Policy:    kubeovnv1.PolicyDst,
-				CIDR:      "0.0.0.0/0",
-				NextHopIP: gatewayV4,
-			})
+			for rtb := range rtbs {
+				targetRoutes = append(targetRoutes, &kubeovnv1.StaticRoute{
+					Policy:     kubeovnv1.PolicyDst,
+					CIDR:       "0.0.0.0/0",
+					NextHopIP:  gatewayV4,
+					RouteTable: rtb,
+				})
+			}
 		}
 		if gatewayV6 != "" {
-			targetRoutes = append(targetRoutes, &kubeovnv1.StaticRoute{
-				Policy:    kubeovnv1.PolicyDst,
-				CIDR:      "::/0",
-				NextHopIP: gatewayV6,
-			})
+			for rtb := range rtbs {
+				targetRoutes = append(targetRoutes, &kubeovnv1.StaticRoute{
+					Policy:     kubeovnv1.PolicyDst,
+					CIDR:       "::/0",
+					NextHopIP:  gatewayV6,
+					RouteTable: rtb,
+				})
+			}
 		}
 
 		if c.config.EnableEipSnat {
@@ -314,57 +337,51 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 				}
 
 				for _, nat := range lr.Nat {
-					logical_ip, err := c.ovnLegacyClient.GetNatIPInfo(nat)
+					logicalIP, err := c.ovnLegacyClient.GetNatIPInfo(nat)
 					if err != nil {
 						klog.Errorf("failed to get nat ip info for vpc %s, %v", vpc.Name, err)
 						return err
 					}
-					if logical_ip != "" {
-						targetRoutes = append(targetRoutes, &kubeovnv1.StaticRoute{
-							Policy:    kubeovnv1.PolicySrc,
-							CIDR:      logical_ip,
-							NextHopIP: nextHop,
-						})
+					if logicalIP != "" {
+						for rtb := range rtbs {
+							targetRoutes = append(targetRoutes, &kubeovnv1.StaticRoute{
+								Policy:     kubeovnv1.PolicySrc,
+								CIDR:       logicalIP,
+								NextHopIP:  nextHop,
+								RouteTable: rtb,
+							})
+						}
 					}
 				}
 			}
 		}
 	}
-	if vpc.Name == c.config.ClusterRouter && vpc.Spec.EnableExternal {
-		// custom vpc enable external, just like default vpc with enable eip and snat above
-		targetRoutes = vpc.Spec.StaticRoutes
-	}
+
 	routeNeedDel, routeNeedAdd, err := diffStaticRoute(existRoute, targetRoutes)
 	if err != nil {
 		klog.Errorf("failed to diff vpc %s static route, %v", vpc.Name, err)
 		return err
 	}
 	for _, item := range routeNeedDel {
-		if err = c.ovnLegacyClient.DeleteStaticRoute(item.CIDR, vpc.Name); err != nil {
+		policy := convertPolicy(item.Policy)
+		if err = c.ovnClient.DeleteLogicalRouterStaticRoute(vpc.Name, &item.RouteTable, &policy, item.CIDR, item.NextHopIP); err != nil {
 			klog.Errorf("del vpc %s static route failed, %v", vpc.Name, err)
 			return err
 		}
 	}
 
 	for _, item := range routeNeedAdd {
-		if item.ECMPMode == "" {
-			if err = c.ovnLegacyClient.AddStaticRoute(convertPolicy(item.Policy), item.CIDR, item.NextHopIP,
-				"", "", vpc.Name, util.NormalRouteType); err != nil {
-				klog.Errorf("add normal static route to vpc %s failed, %v", vpc.Name, err)
-				return err
-			}
-		} else {
-			if err = c.ovnLegacyClient.AddStaticRoute(convertPolicy(item.Policy), item.CIDR, item.NextHopIP,
-				item.ECMPMode, item.BfdId, vpc.Name, util.EcmpRouteType); err != nil {
-				klog.Errorf("add ecmp static route to vpc %s failed, %v", vpc.Name, err)
-				return err
-			}
+		if err = c.ovnClient.AddLogicalRouterStaticRoute(
+			vpc.Name, item.RouteTable, convertPolicy(item.Policy), item.CIDR, item.NextHopIP,
+		); err != nil {
+			klog.Errorf("add static route to vpc %s failed, %v", vpc.Name, err)
+			return err
 		}
 	}
 
-	if vpc.Name != util.DefaultVpc && vpc.Spec.PolicyRoutes == nil {
+	if vpc.Name != c.config.ClusterRouter && vpc.Spec.PolicyRoutes == nil {
 		// do not clean default vpc policy routes
-		if err = c.ovnLegacyClient.CleanPolicyRoute(vpc.Name); err != nil {
+		if err = c.ovnClient.ClearLogicalRouterPolicy(vpc.Name); err != nil {
 			klog.Errorf("clean all vpc %s policy route failed, %v", vpc.Name, err)
 			return err
 		}
@@ -372,27 +389,27 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 
 	if vpc.Spec.PolicyRoutes != nil {
 		// diff update vpc policy route
-		existPolicyRoute, err := c.ovnLegacyClient.GetPolicyRouteList(vpc.Name)
+		policyList, err := c.ovnClient.ListLogicalRouterPolicies(vpc.Name, -1, nil)
 		if err != nil {
 			klog.Errorf("failed to get vpc %s policy route list, %v", vpc.Name, err)
 			return err
 		}
-		policyRouteNeedDel, policyRouteNeedAdd, err := diffPolicyRoute(existPolicyRoute, vpc.Spec.PolicyRoutes)
+		policyRouteNeedDel, policyRouteNeedAdd, err := diffPolicyRoute(policyList, vpc.Spec.PolicyRoutes)
 		if err != nil {
 			klog.Errorf("failed to diff vpc %s policy route, %v", vpc.Name, err)
 			return err
 		}
 		for _, item := range policyRouteNeedDel {
 			klog.Infof("delete policy route for router: %s, priority: %d, match %s", vpc.Name, item.Priority, item.Match)
-			if err = c.ovnLegacyClient.DeletePolicyRoute(vpc.Name, item.Priority, item.Match); err != nil {
+			if err = c.ovnClient.DeleteLogicalRouterPolicy(vpc.Name, item.Priority, item.Match); err != nil {
 				klog.Errorf("del vpc %s policy route failed, %v", vpc.Name, err)
 				return err
 			}
 		}
 		for _, item := range policyRouteNeedAdd {
 			externalIDs := map[string]string{"vendor": util.CniTypeName}
-			klog.Infof("add policy route for router: %s, match %s, action %s, nexthop %s, extrenalID %v", c.config.ClusterRouter, item.Match, string(item.Action), item.NextHopIP, externalIDs)
-			if err = c.ovnLegacyClient.AddPolicyRoute(vpc.Name, item.Priority, item.Match, string(item.Action), item.NextHopIP, externalIDs); err != nil {
+			klog.Infof("add policy route for router: %s, match %s, action %s, nexthop %s, externalID %v", c.config.ClusterRouter, item.Match, string(item.Action), item.NextHopIP, externalIDs)
+			if err = c.ovnClient.AddLogicalRouterPolicy(vpc.Name, item.Priority, item.Match, string(item.Action), []string{item.NextHopIP}, externalIDs); err != nil {
 				klog.Errorf("add policy route to vpc %s failed, %v", vpc.Name, err)
 				return err
 			}
@@ -444,7 +461,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 
 	if cachedVpc.Spec.EnableExternal {
 		if !cachedVpc.Status.EnableExternal {
-			// connecte vpc to external
+			// connect vpc to external
 			klog.V(3).Infof("connect external network with vpc %s", vpc.Name)
 			if err := c.handleAddVpcExternal(key); err != nil {
 				klog.Errorf("failed to add external connection for vpc %s, error %v", key, err)
@@ -453,7 +470,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 		}
 		if vpc.Spec.EnableBfd {
 			klog.V(3).Infof("remove normal static ecmp route for vpc %s", vpc.Name)
-			// auto remove normal type static route, if use ecmp based bfd
+			// auto remove normal type static route, if using ecmp based bfd
 			if err := c.reconcileVpcDelNormalStaticRoute(vpc.Name); err != nil {
 				klog.Errorf("failed to reconcile del vpc %q normal static route", vpc.Name)
 				return err
@@ -471,7 +488,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 
 	if !cachedVpc.Spec.EnableBfd && cachedVpc.Status.EnableBfd {
 		lrpEipName := fmt.Sprintf("%s-%s", key, c.config.ExternalGatewaySwitch)
-		if err := c.ovnLegacyClient.DeleteBfd(lrpEipName, ""); err != nil {
+		if err := c.ovnClient.DeleteBFD(lrpEipName, ""); err != nil {
 			klog.Error(err)
 			return err
 		}
@@ -492,14 +509,13 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	return nil
 }
 
-func diffPolicyRoute(exist []*ovs.PolicyRoute, target []*kubeovnv1.PolicyRoute) (routeNeedDel []*kubeovnv1.PolicyRoute, routeNeedAdd []*kubeovnv1.PolicyRoute, err error) {
+func diffPolicyRoute(exist []*ovnnb.LogicalRouterPolicy, target []*kubeovnv1.PolicyRoute) (routeNeedDel, routeNeedAdd []*kubeovnv1.PolicyRoute, err error) {
 	existV1 := make([]*kubeovnv1.PolicyRoute, 0, len(exist))
 	for _, item := range exist {
 		existV1 = append(existV1, &kubeovnv1.PolicyRoute{
-			Priority:  item.Priority,
-			Match:     item.Match,
-			Action:    kubeovnv1.PolicyRouteAction(item.Action),
-			NextHopIP: item.NextHopIP,
+			Priority: item.Priority,
+			Match:    item.Match,
+			Action:   kubeovnv1.PolicyRouteAction(item.Action),
 		})
 	}
 
@@ -526,25 +542,23 @@ func getPolicyRouteItemKey(item *kubeovnv1.PolicyRoute) (key string) {
 	return fmt.Sprintf("%d:%s:%s:%s", item.Priority, item.Match, item.Action, item.NextHopIP)
 }
 
-func diffStaticRoute(exist []*ovs.StaticRoute, target []*kubeovnv1.StaticRoute) (routeNeedDel []*kubeovnv1.StaticRoute, routeNeedAdd []*kubeovnv1.StaticRoute, err error) {
-	existV1 := make([]*kubeovnv1.StaticRoute, 0, len(exist))
+func diffStaticRoute(exist []*ovnnb.LogicalRouterStaticRoute, target []*kubeovnv1.StaticRoute) (routeNeedDel, routeNeedAdd []*kubeovnv1.StaticRoute, err error) {
+	existRouteMap := make(map[string]*kubeovnv1.StaticRoute, len(exist))
 	for _, item := range exist {
 		policy := kubeovnv1.PolicyDst
-		if item.Policy == ovs.PolicySrcIP {
+		if item.Policy != nil && *item.Policy == ovnnb.LogicalRouterStaticRoutePolicySrcIP {
 			policy = kubeovnv1.PolicySrc
 		}
-		existV1 = append(existV1, &kubeovnv1.StaticRoute{
-			Policy:    policy,
-			CIDR:      item.CIDR,
-			NextHopIP: item.NextHop,
-			ECMPMode:  item.ECMPMode,
-			BfdId:     item.BfdId,
-		})
-	}
-
-	existRouteMap := make(map[string]*kubeovnv1.StaticRoute, len(exist))
-	for _, item := range existV1 {
-		existRouteMap[getStaticRouteItemKey(item)] = item
+		route := &kubeovnv1.StaticRoute{
+			Policy:     policy,
+			CIDR:       item.IPPrefix,
+			NextHopIP:  item.Nexthop,
+			RouteTable: item.RouteTable,
+		}
+		if item.BFD != nil {
+			route.BfdId = *item.BFD
+		}
+		existRouteMap[getStaticRouteItemKey(route)] = route
 	}
 
 	for _, item := range target {
@@ -563,9 +577,9 @@ func diffStaticRoute(exist []*ovs.StaticRoute, target []*kubeovnv1.StaticRoute) 
 
 func getStaticRouteItemKey(item *kubeovnv1.StaticRoute) (key string) {
 	if item.Policy == kubeovnv1.PolicyDst {
-		return fmt.Sprintf("dst:%s=>%s", item.CIDR, item.NextHopIP)
+		return fmt.Sprintf("%s:dst:%s=>%s", item.RouteTable, item.CIDR, item.NextHopIP)
 	} else {
-		return fmt.Sprintf("src:%s=>%s", item.CIDR, item.NextHopIP)
+		return fmt.Sprintf("%s:src:%s=>%s", item.RouteTable, item.CIDR, item.NextHopIP)
 	}
 }
 
@@ -624,10 +638,9 @@ func formatVpc(vpc *kubeovnv1.Vpc, c *Controller) error {
 
 func convertPolicy(origin kubeovnv1.RoutePolicy) string {
 	if origin == kubeovnv1.PolicyDst {
-		return ovs.PolicyDstIP
-	} else {
-		return ovs.PolicySrcIP
+		return ovnnb.LogicalRouterStaticRoutePolicyDstIP
 	}
+	return ovnnb.LogicalRouterStaticRoutePolicySrcIP
 }
 
 func (c *Controller) processNextUpdateStatusVpcWorkItem() bool {
@@ -833,12 +846,7 @@ func (c *Controller) handleAddVpcExternal(key string) error {
 		vpc.Name, types.MergePatchType, bytes, metav1.PatchOptions{}, "status"); err != nil {
 		return err
 	}
-	cachedEip, err = c.ovnEipsLister.Get(lrpEipName)
-	if err != nil {
-		return err
-	}
-	if err = c.handleAddOvnEipFinalizer(cachedEip, util.OvnLrpUseEipFinalizer); err != nil {
-		klog.Errorf("failed to add finalizer for ovn eip, %v", err)
+	if _, err = c.ovnEipsLister.Get(lrpEipName); err != nil {
 		return err
 	}
 	if err := c.patchLrpOvnEipEnableBfdLabel(lrpEipName, vpc.Spec.EnableBfd); err != nil {
@@ -849,7 +857,7 @@ func (c *Controller) handleAddVpcExternal(key string) error {
 }
 
 func (c *Controller) handleDeleteVpcStaticRoute(key string) error {
-	vpc, err := c.config.KubeOvnClient.KubeovnV1().Vpcs().Get(context.Background(), key, metav1.GetOptions{})
+	vpc, err := c.vpcsLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			return nil
@@ -908,17 +916,6 @@ func (c *Controller) handleDelVpcExternal(key string) error {
 		vpc.Name, types.MergePatchType, bytes, metav1.PatchOptions{}, "status"); err != nil {
 		return err
 	}
-	cachedEip, err := c.ovnEipsLister.Get(lrpName)
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	if err = c.handleDelOvnEipFinalizer(cachedEip, util.OvnLrpUseEipFinalizer); err != nil {
-		klog.Errorf("failed to del finalizer for ovn eip, %v", err)
-		return err
-	}
 	if err = c.config.KubeOvnClient.KubeovnV1().OvnEips().Delete(context.Background(), lrpName, metav1.DeleteOptions{}); err != nil {
 		if !k8serrors.IsNotFound(err) {
 			klog.Errorf("failed to delete ovn eip %s, %v", lrpName, err)
@@ -927,7 +924,7 @@ func (c *Controller) handleDelVpcExternal(key string) error {
 	}
 
 	// del all vpc bfds
-	if err := c.ovnLegacyClient.DeleteBfd(lrpName, ""); err != nil {
+	if err := c.ovnClient.DeleteBFD(lrpName, ""); err != nil {
 		klog.Error(err)
 		return err
 	}
@@ -958,4 +955,12 @@ func (c *Controller) patchVpcBfdStatus(key string) error {
 		}
 	}
 	return nil
+}
+
+func (c *Controller) getRouteTablesByVpc(vpc *kubeovnv1.Vpc) map[string][]*kubeovnv1.StaticRoute {
+	rtbs := make(map[string][]*kubeovnv1.StaticRoute)
+	for _, route := range vpc.Spec.StaticRoutes {
+		rtbs[route.RouteTable] = append(rtbs[route.RouteTable], route)
+	}
+	return rtbs
 }

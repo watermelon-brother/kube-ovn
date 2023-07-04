@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	clientset "k8s.io/client-go/kubernetes"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
@@ -68,7 +67,7 @@ var _ = framework.OrderedDescribe("[group:node]", func() {
 		join := subnetClient.Get("join")
 
 		ginkgo.By("Getting nodes")
-		nodeList, err := e2enode.GetReadySchedulableNodes(cs)
+		nodeList, err := e2enode.GetReadySchedulableNodes(context.Background(), cs)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Validating node annotations")
@@ -100,7 +99,7 @@ var _ = framework.OrderedDescribe("[group:node]", func() {
 			ips := strings.Split(util.GetIpAddrWithMask(node.Annotations[util.IpAddressAnnotation], join.Spec.CIDRBlock), ",")
 			framework.ExpectConsistOf(links[0].NonLinkLocalAddresses(), ips)
 
-			err = podClient.Delete(context.Background(), podName, metav1.DeleteOptions{})
+			err = podClient.Delete(podName)
 			framework.ExpectNoError(err)
 		}
 	})
@@ -109,7 +108,7 @@ var _ = framework.OrderedDescribe("[group:node]", func() {
 		f.SkipVersionPriorTo(1, 12, "This feature was introduce in v1.12")
 
 		ginkgo.By("Creating subnet " + subnetName)
-		subnet = framework.MakeSubnet(subnetName, "", cidr, "", nil, nil, nil)
+		subnet = framework.MakeSubnet(subnetName, "", cidr, "", "", "", nil, nil, nil)
 		subnet = subnetClient.CreateSync(subnet)
 
 		ginkgo.By("Creating pod " + podName)
@@ -149,7 +148,7 @@ var _ = framework.OrderedDescribe("[group:node]", func() {
 		f.SkipVersionPriorTo(1, 12, "This feature was introduce in v1.12")
 
 		ginkgo.By("Creating subnet " + subnetName)
-		subnet = framework.MakeSubnet(subnetName, "", cidr, "", nil, nil, nil)
+		subnet = framework.MakeSubnet(subnetName, "", cidr, "", "", "", nil, nil, nil)
 		subnet = subnetClient.CreateSync(subnet)
 
 		ginkgo.By("Creating pod " + podName)
@@ -171,8 +170,6 @@ var _ = framework.OrderedDescribe("[group:node]", func() {
 			TargetPort: intstr.FromInt(port),
 		}}
 		service := framework.MakeService(serviceName, "", nil, podLabels, ports, "")
-		service.Spec.IPFamilyPolicy = new(corev1.IPFamilyPolicy)
-		*service.Spec.IPFamilyPolicy = corev1.IPFamilyPolicyPreferDualStack
 		_ = serviceClient.CreateSync(service, func(s *corev1.Service) (bool, error) {
 			return len(s.Spec.ClusterIPs) != 0, nil
 		}, "cluster ips are not empty")

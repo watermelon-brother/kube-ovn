@@ -5,12 +5,13 @@ import (
 	"strings"
 	"testing"
 
-	ovsclient "github.com/kubeovn/kube-ovn/pkg/ovsdb/client"
-	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
-	"github.com/kubeovn/kube-ovn/pkg/util"
 	"github.com/ovn-org/libovsdb/model"
 	"github.com/ovn-org/libovsdb/ovsdb"
 	"github.com/stretchr/testify/require"
+
+	ovsclient "github.com/kubeovn/kube-ovn/pkg/ovsdb/client"
+	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
+	"github.com/kubeovn/kube-ovn/pkg/util"
 )
 
 func (suite *OvnClientTestSuite) testCreatePortGroup() {
@@ -74,7 +75,7 @@ func (suite *OvnClientTestSuite) testPortGroupResetPorts() {
 	require.NoError(t, err)
 	require.NotEmpty(t, pg.Ports)
 
-	err = ovnClient.PortGroupResetPorts(pgName)
+	err = ovnClient.PortGroupSetPorts(pgName, nil)
 	require.NoError(t, err)
 
 	pg, err = ovnClient.GetPortGroup(pgName, false)

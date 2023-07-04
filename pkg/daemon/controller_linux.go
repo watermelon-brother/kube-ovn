@@ -14,7 +14,7 @@ import (
 	"syscall"
 
 	"github.com/alauda/felix/ipsets"
-	"github.com/coreos/go-iptables/iptables"
+	"github.com/kubeovn/go-iptables/iptables"
 	"github.com/vishvananda/netlink"
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -22,6 +22,8 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
+	k8sipset "k8s.io/kubernetes/pkg/util/ipset"
+	k8siptables "k8s.io/kubernetes/pkg/util/iptables"
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ovs"
@@ -30,96 +32,157 @@ import (
 
 // ControllerRuntime represents runtime specific controller members
 type ControllerRuntime struct {
-	iptables   map[string]*iptables.IPTables
-	ipsets     map[string]*ipsets.IPSets
-	gwCounters map[string]*util.GwIPtableCounters
+	iptables         map[string]*iptables.IPTables
+	iptablesObsolete map[string]*iptables.IPTables
+	k8siptables      map[string]k8siptables.Interface
+	k8sipsets        k8sipset.Interface
+	ipsets           map[string]*ipsets.IPSets
+	gwCounters       map[string]*util.GwIPtableCounters
+
+	nmSyncer *networkManagerSyncer
+}
+
+func evalCommandSymlinks(cmd string) (string, error) {
+	path, err := exec.LookPath(cmd)
+	if err != nil {
+		return "", fmt.Errorf("failed to search for command %q: %v", cmd, err)
+	}
+	file, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to read evaluate symbolic links for file %q: %v", path, err)
+	}
+
+	return file, nil
+}
+
+func isLegacyIptablesMode() (bool, error) {
+	path, err := evalCommandSymlinks("iptables")
+	if err != nil {
+		return false, err
+	}
+	pathLegacy, err := evalCommandSymlinks("iptables-legacy")
+	if err != nil {
+		return false, err
+	}
+	return path == pathLegacy, nil
 }
 
 func (c *Controller) initRuntime() error {
-	c.ControllerRuntime.iptables = make(map[string]*iptables.IPTables)
-	c.ControllerRuntime.ipsets = make(map[string]*ipsets.IPSets)
-	c.ControllerRuntime.gwCounters = make(map[string]*util.GwIPtableCounters)
+	ok, err := isLegacyIptablesMode()
+	if err != nil {
+		klog.Errorf("failed to check iptables mode: %v", err)
+		return err
+	}
+	if !ok {
+		// iptables works in nft mode, we should migrate iptables rules
+		c.iptablesObsolete = make(map[string]*iptables.IPTables, 2)
+	}
+
+	c.iptables = make(map[string]*iptables.IPTables)
+	c.ipsets = make(map[string]*ipsets.IPSets)
+	c.gwCounters = make(map[string]*util.GwIPtableCounters)
+	c.k8siptables = make(map[string]k8siptables.Interface)
+	c.k8sipsets = k8sipset.New(c.k8sExec)
 
 	if c.protocol == kubeovnv1.ProtocolIPv4 || c.protocol == kubeovnv1.ProtocolDual {
-		iptables, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+		ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 		if err != nil {
 			return err
 		}
-		c.ControllerRuntime.iptables[kubeovnv1.ProtocolIPv4] = iptables
-		c.ControllerRuntime.ipsets[kubeovnv1.ProtocolIPv4] = ipsets.NewIPSets(ipsets.NewIPVersionConfig(ipsets.IPFamilyV4, IPSetPrefix, nil, nil))
+		c.iptables[kubeovnv1.ProtocolIPv4] = ipt
+		if c.iptablesObsolete != nil {
+			if ipt, err = iptables.NewWithProtocolAndMode(iptables.ProtocolIPv4, "legacy"); err != nil {
+				return err
+			}
+			c.iptablesObsolete[kubeovnv1.ProtocolIPv4] = ipt
+		}
+		c.ipsets[kubeovnv1.ProtocolIPv4] = ipsets.NewIPSets(ipsets.NewIPVersionConfig(ipsets.IPFamilyV4, IPSetPrefix, nil, nil))
+		c.k8siptables[kubeovnv1.ProtocolIPv4] = k8siptables.New(c.k8sExec, k8siptables.ProtocolIPv4)
 	}
 	if c.protocol == kubeovnv1.ProtocolIPv6 || c.protocol == kubeovnv1.ProtocolDual {
-		iptables, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
+		ipt, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
 		if err != nil {
 			return err
 		}
-		c.ControllerRuntime.iptables[kubeovnv1.ProtocolIPv6] = iptables
-		c.ControllerRuntime.ipsets[kubeovnv1.ProtocolIPv6] = ipsets.NewIPSets(ipsets.NewIPVersionConfig(ipsets.IPFamilyV6, IPSetPrefix, nil, nil))
+		c.iptables[kubeovnv1.ProtocolIPv6] = ipt
+		if c.iptablesObsolete != nil {
+			if ipt, err = iptables.NewWithProtocolAndMode(iptables.ProtocolIPv6, "legacy"); err != nil {
+				return err
+			}
+			c.iptablesObsolete[kubeovnv1.ProtocolIPv6] = ipt
+		}
+		c.ipsets[kubeovnv1.ProtocolIPv6] = ipsets.NewIPSets(ipsets.NewIPVersionConfig(ipsets.IPFamilyV6, IPSetPrefix, nil, nil))
+		c.k8siptables[kubeovnv1.ProtocolIPv6] = k8siptables.New(c.k8sExec, k8siptables.ProtocolIPv6)
 	}
+
+	c.nmSyncer = newNetworkManagerSyncer()
+	c.nmSyncer.Run(c.transferAddrsAndRoutes)
 
 	return nil
 }
 
-func (c *Controller) reconcileRouters(event subnetEvent) error {
+func (c *Controller) reconcileRouters(event *subnetEvent) error {
 	subnets, err := c.subnetsLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("failed to list subnets %v", err)
 		return err
 	}
 
-	var ok bool
-	var oldSubnet, newSubnet *kubeovnv1.Subnet
-	if event.old != nil {
-		if oldSubnet, ok = event.old.(*kubeovnv1.Subnet); !ok {
-			klog.Errorf("expected old subnet in subnetEvent but got %#v", event.old)
-			return nil
-		}
-	}
-	if event.new != nil {
-		if newSubnet, ok = event.new.(*kubeovnv1.Subnet); !ok {
-			klog.Errorf("expected new subnet in subnetEvent but got %#v", event.new)
-			return nil
-		}
-	}
-
-	// handle policy routing
-	rulesToAdd, rulesToDel, routesToAdd, routesToDel, err := c.diffPolicyRouting(oldSubnet, newSubnet)
-	if err != nil {
-		klog.Errorf("failed to get policy routing difference: %v", err)
-		return err
-	}
-	// add new routes first
-	for _, r := range routesToAdd {
-		if err = netlink.RouteReplace(&r); err != nil && !errors.Is(err, syscall.EEXIST) {
-			klog.Errorf("failed to replace route for subnet %s: %v", newSubnet.Name, err)
-			return err
-		}
-	}
-	// next, add new rules
-	for _, r := range rulesToAdd {
-		if err = netlink.RuleAdd(&r); err != nil && !errors.Is(err, syscall.EEXIST) {
-			klog.Errorf("failed to add network rule for subnet %s: %v", newSubnet.Name, err)
-			return err
-		}
-	}
-	// then delete old network rules
-	for _, r := range rulesToDel {
-		// loop to delete all matched rules
-		for {
-			if err = netlink.RuleDel(&r); err != nil {
-				if !errors.Is(err, syscall.ENOENT) {
-					klog.Errorf("failed to delete network rule for subnet %s: %v", oldSubnet.Name, err)
-					return err
-				}
-				break
+	if event != nil {
+		var ok bool
+		var oldSubnet, newSubnet *kubeovnv1.Subnet
+		if event.old != nil {
+			if oldSubnet, ok = event.old.(*kubeovnv1.Subnet); !ok {
+				klog.Errorf("expected old subnet in subnetEvent but got %#v", event.old)
+				return nil
 			}
 		}
-	}
-	// last, delete old network routes
-	for _, r := range routesToDel {
-		if err = netlink.RouteDel(&r); err != nil && !errors.Is(err, syscall.ENOENT) {
-			klog.Errorf("failed to delete route for subnet %s: %v", oldSubnet.Name, err)
+		if event.new != nil {
+			if newSubnet, ok = event.new.(*kubeovnv1.Subnet); !ok {
+				klog.Errorf("expected new subnet in subnetEvent but got %#v", event.new)
+				return nil
+			}
+		}
+
+		// handle policy routing
+		rulesToAdd, rulesToDel, routesToAdd, routesToDel, err := c.diffPolicyRouting(oldSubnet, newSubnet)
+		if err != nil {
+			klog.Errorf("failed to get policy routing difference: %v", err)
 			return err
+		}
+		// add new routes first
+		for _, r := range routesToAdd {
+			if err = netlink.RouteReplace(&r); err != nil && !errors.Is(err, syscall.EEXIST) {
+				klog.Errorf("failed to replace route for subnet %s: %v", newSubnet.Name, err)
+				return err
+			}
+		}
+		// next, add new rules
+		for _, r := range rulesToAdd {
+			if err = netlink.RuleAdd(&r); err != nil && !errors.Is(err, syscall.EEXIST) {
+				klog.Errorf("failed to add network rule for subnet %s: %v", newSubnet.Name, err)
+				return err
+			}
+		}
+		// then delete old network rules
+		for _, r := range rulesToDel {
+			// loop to delete all matched rules
+			for {
+				if err = netlink.RuleDel(&r); err != nil {
+					if !errors.Is(err, syscall.ENOENT) {
+						klog.Errorf("failed to delete network rule for subnet %s: %v", oldSubnet.Name, err)
+						return err
+					}
+					break
+				}
+			}
+		}
+		// last, delete old network routes
+		for _, r := range routesToDel {
+			if err = netlink.RouteDel(&r); err != nil && !errors.Is(err, syscall.ENOENT) {
+				klog.Errorf("failed to delete route for subnet %s: %v", oldSubnet.Name, err)
+				return err
+			}
 		}
 	}
 
@@ -133,7 +196,7 @@ func (c *Controller) reconcileRouters(event subnetEvent) error {
 	joinCIDR := make([]string, 0, 2)
 	cidrs := make([]string, 0, len(subnets)*2)
 	for _, subnet := range subnets {
-		if (subnet.Spec.Vlan != "" && !subnet.Spec.LogicalGateway) || subnet.Spec.Vpc != util.DefaultVpc || !subnet.Status.IsReady() {
+		if (subnet.Spec.Vlan != "" && !subnet.Spec.LogicalGateway) || subnet.Spec.Vpc != c.config.ClusterRouter || !subnet.Status.IsReady() {
 			continue
 		}
 
@@ -331,7 +394,7 @@ func (c *Controller) diffPolicyRouting(oldSubnet, newSubnet *kubeovnv1.Subnet) (
 }
 
 func (c *Controller) getPolicyRouting(subnet *kubeovnv1.Subnet) ([]netlink.Rule, []netlink.Route, error) {
-	if subnet == nil || subnet.Spec.ExternalEgressGateway == "" || subnet.Spec.Vpc != util.DefaultVpc {
+	if subnet == nil || subnet.Spec.ExternalEgressGateway == "" || subnet.Spec.Vpc != c.config.ClusterRouter {
 		return nil, nil, nil
 	}
 	if subnet.Spec.GatewayType == kubeovnv1.GWCentralizedType && !util.GatewayContains(subnet.Spec.GatewayNode, c.config.NodeName) {

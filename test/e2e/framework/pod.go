@@ -2,6 +2,7 @@ package framework
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -14,6 +15,7 @@ import (
 )
 
 type PodClient struct {
+	f *Framework
 	*e2epod.PodClient
 }
 
@@ -22,20 +24,32 @@ func (f *Framework) PodClient() *PodClient {
 }
 
 func (f *Framework) PodClientNS(namespace string) *PodClient {
-	return &PodClient{e2epod.PodClientNS(f.Framework, namespace)}
+	return &PodClient{f, e2epod.PodClientNS(f.Framework, namespace)}
+}
+
+func (c *PodClient) Create(pod *corev1.Pod) *corev1.Pod {
+	return c.PodClient.Create(context.Background(), pod)
+}
+
+func (c *PodClient) CreateSync(pod *corev1.Pod) *corev1.Pod {
+	return c.PodClient.CreateSync(context.Background(), pod)
+}
+
+func (c *PodClient) Delete(name string) error {
+	return c.PodClient.Delete(context.Background(), name, metav1.DeleteOptions{})
 }
 
 func (c *PodClient) DeleteSync(name string) {
-	c.PodClient.DeleteSync(name, metav1.DeleteOptions{}, timeout)
+	c.PodClient.DeleteSync(context.Background(), name, metav1.DeleteOptions{}, timeout)
 }
 
-func (c *PodClient) PatchPod(original, modified *corev1.Pod) *corev1.Pod {
+func (c *PodClient) Patch(original, modified *corev1.Pod) *corev1.Pod {
 	patch, err := util.GenerateMergePatchPayload(original, modified)
 	ExpectNoError(err)
 
 	var patchedPod *corev1.Pod
-	err = wait.PollImmediate(2*time.Second, timeout, func() (bool, error) {
-		p, err := c.PodInterface.Patch(context.TODO(), original.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "")
+	err = wait.PollUntilContextTimeout(context.Background(), 2*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+		p, err := c.PodInterface.Patch(ctx, original.Name, types.StrategicMergePatchType, patch, metav1.PatchOptions{}, "")
 		if err != nil {
 			return handleWaitingAPIError(err, false, "patch pod %s/%s", original.Namespace, original.Name)
 		}
@@ -46,12 +60,22 @@ func (c *PodClient) PatchPod(original, modified *corev1.Pod) *corev1.Pod {
 		return patchedPod.DeepCopy()
 	}
 
-	if IsTimeout(err) {
+	if errors.Is(err, context.DeadlineExceeded) {
 		Failf("timed out while retrying to patch pod %s/%s", original.Namespace, original.Name)
 	}
-	ExpectNoError(maybeTimeoutError(err, "patching pod %s/%s", original.Namespace, original.Name))
+	Failf("error occurred while retrying to patch pod %s/%s: %v", original.Namespace, original.Name, err)
 
 	return nil
+}
+
+func (c *PodClient) WaitForRunning(name string) {
+	err := e2epod.WaitTimeoutForPodRunningInNamespace(context.TODO(), c.f.ClientSet, name, c.f.Namespace.Name, timeout)
+	ExpectNoError(err)
+}
+
+func (c *PodClient) WaitForNotFound(name string) {
+	err := e2epod.WaitForPodNotFoundInNamespace(context.TODO(), c.f.ClientSet, name, c.f.Namespace.Name, timeout)
+	ExpectNoError(err)
 }
 
 func MakePod(ns, name string, labels, annotations map[string]string, image string, command, args []string) *corev1.Pod {
@@ -78,6 +102,8 @@ func MakePod(ns, name string, labels, annotations map[string]string, image strin
 			},
 		},
 	}
+	pod.Spec.TerminationGracePeriodSeconds = new(int64)
+	*pod.Spec.TerminationGracePeriodSeconds = 3
 
 	return pod
 }

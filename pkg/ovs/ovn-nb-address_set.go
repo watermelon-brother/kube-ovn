@@ -3,8 +3,12 @@ package ovs
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
 
 	"github.com/ovn-org/libovsdb/client"
+	"github.com/scylladb/go-set/strset"
+	"k8s.io/klog/v2"
 
 	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 )
@@ -50,6 +54,21 @@ func (c *ovnClient) AddressSetUpdateAddress(asName string, addresses ...string) 
 	if err != nil {
 		return fmt.Errorf("get address set %s: %v", asName, err)
 	}
+
+	// format CIDR to keep addresses the same in both nb and sb
+	for i, addr := range addresses {
+		if strings.ContainsRune(addr, '/') {
+			_, ipNet, err := net.ParseCIDR(addr)
+			if err != nil {
+				klog.Warningf("failed to parse CIDR %q: %v", addr, err)
+				continue
+			}
+			addresses[i] = ipNet.String()
+		}
+	}
+
+	// update will failed when slice contains duplicate elements
+	addresses = strset.New(addresses...).List()
 
 	// clear addresses when addresses is empty
 	as.Addresses = addresses

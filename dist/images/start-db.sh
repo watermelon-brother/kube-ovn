@@ -1,6 +1,9 @@
 #!/bin/bash
 set -eo pipefail
 
+DEBUG_WRAPPER=${DEBUG_WRAPPER:-}
+DEBUG_OPT="--ovn-northd-wrapper=$DEBUG_WRAPPER --ovsdb-nb-wrapper=$DEBUG_WRAPPER --ovsdb-sb-wrapper=$DEBUG_WRAPPER"
+
 # https://bugs.launchpad.net/neutron/+bug/1776778
 if grep -q "3.10.0-862" /proc/version
 then
@@ -138,41 +141,43 @@ function ovn_db_pre_start() {
 
     local db_file="/etc/ovn/ovn${1}_db.db"
     if [ -e "$db_file" ]; then
-        if ! ovsdb_tool check-cluster "$db_file"; then
-            echo "detected database corruption for file $db_file, rebuild it."
-            local sid=$(ovsdb-tool db-sid "$db_file")
-            if ! echo -n "$sid" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
-                echo "failed to get sid from $1 db file $db_file"
-                return 1
-            fi
-            echo "get local server id $sid"
+       if ovsdb-tool db-is-clustered "$db_file"; then
+          if ! ovsdb-tool check-cluster "$db_file"; then
+              echo "detected database corruption for file $db_file, rebuild it."
+              local sid=$(ovsdb-tool db-sid "$db_file")
+              if ! echo -n "$sid" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+                  echo "failed to get sid from $1 db file $db_file"
+                  return 1
+              fi
+              echo "get local server id $sid"
 
-            eval port="\$${db_eval}_CLUSTER_PORT"
-            local local_addr="$(gen_conn_addr $DB_CLUSTER_ADDR $port)"
-            echo "local address: $local_addr"
+              eval port="\$${db_eval}_CLUSTER_PORT"
+              local local_addr="$(gen_conn_addr $DB_CLUSTER_ADDR $port)"
+              echo "local address: $local_addr"
 
-            local remote_addr=()
-            local node_ips=$(echo -n "${NODE_IPS}" | sed 's/,/ /g')
-            for node_ip in ${node_ips[*]}; do
-                if [ ! "$node_ip" = "$DB_CLUSTER_ADDR" ]; then
-                    remote_addr=(${remote_addr[*]} "$(gen_conn_addr $ip $port)")
-                fi
-            done
-            echo "remote addresses: ${remote_addr[*]}"
+              local remote_addr=()
+              local node_ips=$(echo -n "${NODE_IPS}" | sed 's/,/ /g')
+              for node_ip in ${node_ips[*]}; do
+                  if [ ! "$node_ip" = "$DB_CLUSTER_ADDR" ]; then
+                      remote_addr=(${remote_addr[*]} "$(gen_conn_addr $node_ip $port)")
+                  fi
+              done
+              echo "remote addresses: ${remote_addr[*]}"
 
-            local db_new="$db_file.init-$(random_str)"
-            echo "generating new database file $db_new"
-            if [ ${#remote_addr[*]} -ne 0 ]; then
-                ovsdb_tool --sid $sid join-cluster "$db_new" $db $local_addr ${remote_addr[*]} || return 1
+              local db_new="$db_file.init-$(random_str)"
+              echo "generating new database file $db_new"
+              if [ ${#remote_addr[*]} -ne 0 ]; then
+                  ovsdb-tool --sid $sid join-cluster "$db_new" $db $local_addr ${remote_addr[*]} || return 1
 
-                local db_bak="$db_file.backup-$(random_str)"
-                echo "backup $db_file to $db_bak"
-                mv "$db_file" "$db_bak" || return 1
+                  local db_bak="$db_file.backup-$(random_str)"
+                  echo "backup $db_file to $db_bak"
+                  mv "$db_file" "$db_bak" || return 1
 
-                echo "use new database file $db_new"
-                mv "$db_new" "$db_file"
-            fi
-        fi
+                  echo "use new database file $db_new"
+                  mv "$db_new" "$db_file"
+              fi
+          fi
+       fi
     fi
 
     # create local config
@@ -227,7 +232,8 @@ if [[ "$ENABLE_SSL" == "false" ]]; then
         set -eo pipefail
         # leader up only when no cluster and on first node
         if [[ ${result} -eq 1 && "$nb_leader_ip" == "$DB_CLUSTER_ADDR" ]]; then
-            ovn_ctl_args="--db-nb-create-insecure-remote=yes \
+            ovn_ctl_args="$DEBUG_OPT \
+                --db-nb-create-insecure-remote=yes \
                 --db-sb-create-insecure-remote=yes \
                 --db-nb-cluster-local-addr=[$DB_CLUSTER_ADDR] \
                 --db-sb-cluster-local-addr=[$DB_CLUSTER_ADDR] \
@@ -240,7 +246,7 @@ if [[ "$ENABLE_SSL" == "false" ]]; then
                 --db-nb-use-remote-in-db=no \
                 --db-sb-use-remote-in-db=no \
                 --ovn-northd-nb-db=$(gen_conn_str 6641) \
-                --ovn-northd-sb-db=$(gen_conn_str 6642)"
+                --ovn-northd-sb-db=$(gen_conn_str 6642) "
             # Start ovn-northd, ovn-nb and ovn-sb
             /usr/share/ovn/scripts/ovn-ctl $ovn_ctl_args \
                 start_nb_ovsdb -- \
@@ -280,7 +286,8 @@ if [[ "$ENABLE_SSL" == "false" ]]; then
             fi
             set -eo pipefail
             # otherwise go to first node
-            ovn_ctl_args="--db-nb-create-insecure-remote=yes \
+            ovn_ctl_args="$DEBUG_OPT \
+                --db-nb-create-insecure-remote=yes \
                 --db-sb-create-insecure-remote=yes \
                 --db-nb-cluster-local-addr=[$DB_CLUSTER_ADDR] \
                 --db-sb-cluster-local-addr=[$DB_CLUSTER_ADDR] \
@@ -352,7 +359,8 @@ else
         result=$?
         set -eo pipefail
         if [[ ${result} -eq 1  &&  "$nb_leader_ip" == "${DB_CLUSTER_ADDR}" ]]; then
-            ovn_ctl_args="--ovn-nb-db-ssl-key=/var/run/tls/key \
+            ovn_ctl_args="$DEBUG_OPT
+                --ovn-nb-db-ssl-key=/var/run/tls/key \
                 --ovn-nb-db-ssl-cert=/var/run/tls/cert \
                 --ovn-nb-db-ssl-ca-cert=/var/run/tls/cacert \
                 --ovn-sb-db-ssl-key=/var/run/tls/key \
@@ -409,7 +417,8 @@ else
                 done
             fi
             set -eo pipefail
-            ovn_ctl_args="--ovn-nb-db-ssl-key=/var/run/tls/key \
+            ovn_ctl_args="$DEBUG_OPT
+                --ovn-nb-db-ssl-key=/var/run/tls/key \
                 --ovn-nb-db-ssl-cert=/var/run/tls/cert \
                 --ovn-nb-db-ssl-ca-cert=/var/run/tls/cacert \
                 --ovn-sb-db-ssl-key=/var/run/tls/key \

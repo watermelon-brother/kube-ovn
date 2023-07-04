@@ -242,9 +242,11 @@ func waitNetworkReady(nic, ipAddr, gateway string, underlayGateway, verbose bool
 	for i, gw := range strings.Split(gateway, ",") {
 		src := strings.Split(ips[i], "/")[0]
 		if !underlayGateway || util.CheckProtocol(gw) == kubeovnv1.ProtocolIPv6 {
-			if err := pingGateway(gw, src, verbose, maxRetry); err != nil {
+			count, err := pingGateway(gw, src, verbose, maxRetry)
+			if err != nil {
 				return err
 			}
+			maxRetry -= count
 		}
 	}
 	return nil
@@ -318,7 +320,7 @@ func configureMirrorLink(portName string, mtu int) error {
 	return nil
 }
 
-func configProviderNic(nicName, brName string) (int, error) {
+func (c *Controller) configProviderNic(nicName, brName string) (int, error) {
 	// nothing to do on Windows
 	return 0, nil
 }

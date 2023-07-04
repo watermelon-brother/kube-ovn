@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ovn-org/libovsdb/ovsdb"
+	"github.com/scylladb/go-set/strset"
 	"github.com/stretchr/testify/require"
 
 	ovsclient "github.com/kubeovn/kube-ovn/pkg/ovsdb/client"
@@ -341,6 +342,44 @@ func (suite *OvnClientTestSuite) testSetLogicalSwitchPortVirtualParents() {
 			require.NoError(t, err)
 			require.Empty(t, lsp.Options["virtual-parents"])
 		}
+	})
+}
+
+func (suite *OvnClientTestSuite) testSetLogicalSwitchPortArpProxy() {
+	t := suite.T()
+	t.Parallel()
+
+	ovnClient := suite.ovnClient
+	lsName := "test-create-port-ls"
+	ips := "10.244.0.37,fc00::af4:25"
+	mac := "00:00:00:AB:B4:65"
+	podNamespace := "test-ns"
+	vpcName := "test-vpc"
+	lspName := "test-update-port-arp-proxy-lsp"
+	err := ovnClient.CreateBareLogicalSwitch(lsName)
+	require.NoError(t, err)
+
+	t.Run("create logical switch port", func(t *testing.T) {
+		err = ovnClient.CreateLogicalSwitchPort(lsName, lspName, ips, mac, lspName, podNamespace, true, "", "", false, nil, vpcName)
+		require.NoError(t, err)
+	})
+
+	t.Run("set arp_proxy option", func(t *testing.T) {
+		enableArpProxy := true
+		err = ovnClient.SetLogicalSwitchPortArpProxy(lspName, enableArpProxy)
+		require.NoError(t, err)
+		lsp, err := ovnClient.GetLogicalSwitchPort(lspName, false)
+		require.NoError(t, err)
+		require.Equal(t, "true", lsp.Options["arp_proxy"])
+	})
+
+	t.Run("clear arp_proxy option", func(t *testing.T) {
+		enableArpProxy := false
+		err = ovnClient.SetLogicalSwitchPortArpProxy(lspName, enableArpProxy)
+		require.NoError(t, err)
+		lsp, err := ovnClient.GetLogicalSwitchPort(lspName, false)
+		require.NoError(t, err)
+		require.Empty(t, lsp.Options["arp_proxy"])
 	})
 }
 
@@ -1106,9 +1145,6 @@ func (suite *OvnClientTestSuite) testDeleteLogicalSwitchPort() {
 		err = ovnClient.DeleteLogicalSwitchPort(lspName)
 		require.NoError(t, err)
 
-		_, err = ovnClient.GetLogicalSwitchPort(lspName, false)
-		require.ErrorContains(t, err, "object not found")
-
 		ls, err = ovnClient.GetLogicalSwitch(lsName, false)
 		require.NoError(t, err)
 		require.NotContains(t, ls.Ports, lsp.UUID)
@@ -1221,7 +1257,7 @@ func (suite *OvnClientTestSuite) testDeleteLogicalSwitchPortOp() {
 
 	ops, err := ovnClient.DeleteLogicalSwitchPortOp(lspName)
 	require.NoError(t, err)
-	require.Len(t, ops, 2)
+	require.Len(t, ops, 1)
 
 	require.Equal(t, []ovsdb.Mutation{
 		{
@@ -1236,21 +1272,6 @@ func (suite *OvnClientTestSuite) testDeleteLogicalSwitchPortOp() {
 			},
 		},
 	}, ops[0].Mutations)
-
-	require.Equal(t,
-		ovsdb.Operation{
-			Op:    "delete",
-			Table: "Logical_Switch_Port",
-			Where: []ovsdb.Condition{
-				{
-					Column:   "_uuid",
-					Function: "==",
-					Value: ovsdb.UUID{
-						GoUUID: lsp.UUID,
-					},
-				},
-			},
-		}, ops[1])
 }
 
 func (suite *OvnClientTestSuite) testlogicalSwitchPortFilter() {
@@ -1500,10 +1521,7 @@ func (suite *OvnClientTestSuite) testgetLogicalSwitchPortSgs() {
 		}
 
 		sgs := getLogicalSwitchPortSgs(lsp)
-		require.Equal(t, map[string]struct{}{
-			"sg1": {},
-			"sg2": {},
-		}, sgs)
+		require.True(t, sgs.IsEqual(strset.New("sg1", "sg2")))
 	})
 
 	t.Run("has no associated security group", func(t *testing.T) {
@@ -1515,7 +1533,7 @@ func (suite *OvnClientTestSuite) testgetLogicalSwitchPortSgs() {
 		}
 
 		sgs := getLogicalSwitchPortSgs(lsp)
-		require.Empty(t, sgs)
+		require.Zero(t, sgs.Size())
 	})
 
 	t.Run("has no external ids", func(t *testing.T) {
@@ -1523,6 +1541,6 @@ func (suite *OvnClientTestSuite) testgetLogicalSwitchPortSgs() {
 		lsp := &ovnnb.LogicalSwitchPort{}
 
 		sgs := getLogicalSwitchPortSgs(lsp)
-		require.Empty(t, sgs)
+		require.Zero(t, sgs.Size())
 	})
 }

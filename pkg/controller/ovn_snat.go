@@ -190,7 +190,7 @@ func (c *Controller) handleAddOvnSnatRule(key string) error {
 		klog.Errorf("failed to get eip, %v", err)
 		return err
 	}
-	if cachedEip.Spec.Type != "" && cachedEip.Spec.Type != util.SnatUsingEip {
+	if cachedEip.Status.Type != "" && cachedEip.Status.Type != util.SnatUsingEip {
 		err = fmt.Errorf("failed to create snat %s, eip '%s' is using by '%s'", key, eipName, cachedEip.Spec.Type)
 		return err
 	}
@@ -224,6 +224,12 @@ func (c *Controller) handleAddOvnSnatRule(key string) error {
 		err = fmt.Errorf("failed to get v4 internal ip for snat %s", key)
 		return err
 	}
+
+	if err = c.patchOvnSnatStatus(key, vpcName, cachedEip.Spec.V4Ip, v4IpCidr, false); err != nil {
+		klog.Errorf("failed to update status for snat %s, %v", key, err)
+		return err
+	}
+
 	// create snat
 	if err = c.handleAddOvnSnatRuleFinalizer(cachedSnat); err != nil {
 		klog.Errorf("failed to add finalizer for ovn snat, %v", err)
@@ -250,6 +256,10 @@ func (c *Controller) handleAddOvnSnatRule(key string) error {
 		klog.Errorf("failed to update status for snat %s, %v", key, err)
 		return err
 	}
+	if err = c.patchOvnEipNat(eipName, util.SnatUsingEip); err != nil {
+		klog.Errorf("failed to patch status for eip %s, %v", key, err)
+		return err
+	}
 	return nil
 }
 
@@ -273,20 +283,23 @@ func (c *Controller) handleUpdateOvnSnatRule(key string) error {
 	}
 	// should delete
 	if !cachedSnat.DeletionTimestamp.IsZero() {
-		klog.V(3).Infof("ovn clean snat %s", key)
+		klog.V(3).Infof("ovn delete snat %s", key)
 		// ovn delete snat
-		if err = c.ovnLegacyClient.DeleteSnatRule(cachedSnat.Status.Vpc, cachedEip.Spec.V4Ip, cachedSnat.Status.V4IpCidr); err != nil {
-			klog.Errorf("failed to delte snat, %v", err)
+		if cachedSnat.Status.Vpc != "" && cachedSnat.Status.V4Eip != "" && cachedSnat.Status.V4IpCidr != "" {
+			if err = c.ovnLegacyClient.DeleteSnatRule(cachedSnat.Status.Vpc, cachedSnat.Status.V4Eip, cachedSnat.Status.V4IpCidr); err != nil {
+				klog.Errorf("failed to delete snat, %v", err)
+				return err
+			}
+		}
+		if err = c.handleDelOvnEipFinalizer(cachedEip, util.OvnSnatUseEipFinalizer); err != nil {
+			klog.Errorf("failed to handle finalizer for eip %s, %v", key, err)
 			return err
 		}
 		//  reset eip
 		c.resetOvnEipQueue.Add(cachedSnat.Spec.OvnEip)
+
 		if err = c.handleDelOvnSnatRuleFinalizer(cachedSnat); err != nil {
 			klog.Errorf("failed to handle finalizer for snat %s, %v", key, err)
-			return err
-		}
-		if err = c.handleDelOvnEipFinalizer(cachedEip, util.OvnSnatUseEipFinalizer); err != nil {
-			klog.Errorf("failed to handle finalizer for eip %s, %v", key, err)
 			return err
 		}
 		return nil
@@ -420,7 +433,9 @@ func (c *Controller) patchOvnSnatStatus(key, vpc, v4Eip, v4IpCidr string, ready 
 		snat.Status.Ready = ready
 		changed = true
 	}
-	if ready && v4Eip != "" && snat.Status.V4Eip != v4Eip {
+	if (v4Eip != "" && snat.Status.V4Eip != v4Eip) ||
+		(v4IpCidr != "" && snat.Status.V4IpCidr != v4IpCidr) ||
+		(vpc != "" && snat.Status.Vpc != vpc) {
 		snat.Status.V4Eip = v4Eip
 		snat.Status.V4IpCidr = v4IpCidr
 		snat.Status.Vpc = vpc
