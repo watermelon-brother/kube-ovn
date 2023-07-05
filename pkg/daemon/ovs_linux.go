@@ -191,6 +191,10 @@ func generateNicName(containerID, ifname string) (string, string) {
 	if ifname == "eth0" {
 		return fmt.Sprintf("%s_h", containerID[0:12]), fmt.Sprintf("%s_c", containerID[0:12])
 	}
+	if strings.HasPrefix(ifname, "pod") {
+		ifname = ifname[3 : len(ifname)-4]
+		return fmt.Sprintf("%s_%s_h", containerID[0:12-len(ifname)], ifname), fmt.Sprintf("%s_%s_c", containerID[0:12-len(ifname)], ifname)
+	}
 	return fmt.Sprintf("%s_%s_h", containerID[0:12-len(ifname)], ifname), fmt.Sprintf("%s_%s_c", containerID[0:12-len(ifname)], ifname)
 }
 

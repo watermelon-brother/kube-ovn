@@ -1050,11 +1050,14 @@ func (c *Controller) syncKubeOvnNet(pod *v1.Pod, podNets []*kubeovnNet) error {
 	key := fmt.Sprintf("%s/%s", pod.Namespace, podName)
 	targetPortNameList := strset.NewWithSize(len(podNets))
 	portsNeedToDel := []string{}
+	annotationsNeedToDel := []string{}
 	subnetUsedByPort := make(map[string]string)
+	portNameToProviderName := map[string]string{}
 
 	for _, podNet := range podNets {
 		portName := ovs.PodNameToPortName(podName, pod.Namespace, podNet.ProviderName)
 		targetPortNameList.Add(portName)
+		portNameToProviderName[portName] = podNet.ProviderName
 	}
 
 	ports, err := c.ovnClient.ListNormalLogicalSwitchPorts(true, map[string]string{"pod": key})
@@ -1067,6 +1070,7 @@ func (c *Controller) syncKubeOvnNet(pod *v1.Pod, podNets []*kubeovnNet) error {
 		if !targetPortNameList.Has(port.Name) {
 			portsNeedToDel = append(portsNeedToDel, port.Name)
 			subnetUsedByPort[port.Name] = port.ExternalIDs["ls"]
+			annotationsNeedToDel = append(annotationsNeedToDel, portNameToProviderName[port.Name])
 		}
 	}
 
@@ -1088,6 +1092,14 @@ func (c *Controller) syncKubeOvnNet(pod *v1.Pod, podNets []*kubeovnNet) error {
 			if !k8serrors.IsNotFound(err) {
 				klog.Errorf("failed to delete ip %s, %v", portNeedDel, err)
 				return err
+			}
+		}
+	}
+
+	for _, providerName := range annotationsNeedToDel {
+		for annotationKey, _ := range pod.Annotations {
+			if strings.HasPrefix(key, providerName) {
+				delete(pod.Annotations, annotationKey)
 			}
 		}
 	}
